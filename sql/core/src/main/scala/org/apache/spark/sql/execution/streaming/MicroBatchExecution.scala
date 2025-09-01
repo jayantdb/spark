@@ -576,9 +576,12 @@ class MicroBatchExecution(
    */
   private def runBatch(sparkSessionToRunBatch: SparkSession): Unit = {
     logDebug(s"Running batch $currentBatchId")
+    logInfo(s"JayantLog: MicroBatchExecution: Running batch $currentBatchId")
 
+    logInfo(s"JayantLog: MicroBatchExecution: Checking available Offsets: $availableOffsets")
     // Request unprocessed data from all sources.
     val mutableNewData = mutable.Map.empty ++ reportTimeTaken("getBatch") {
+
       availableOffsets.flatMap {
         case (source: Source, available: Offset)
           if committedOffsets.get(source).map(_ != available).getOrElse(true) =>
@@ -588,6 +591,7 @@ class MicroBatchExecution(
             s"DataFrame returned by getBatch from $source did not have isStreaming=true\n" +
               s"${batch.queryExecution.logical}")
           logDebug(s"Retrieving data from $source: $current -> $available")
+          logInfo(s"JayantLog: MicroBatchExecution: data from $source: $current -> $available")
           Some(source -> batch.logicalPlan)
 
         case (stream: MicroBatchStream, available)
@@ -601,6 +605,7 @@ class MicroBatchExecution(
           }
           val startOffset = current.getOrElse(stream.initialOffset)
           logDebug(s"Retrieving data from $stream: $current -> $endOffset")
+          logInfo(s"JayantLog: MicroBatchExecution: data from $stream: $current -> $endOffset")
 
           // To be compatible with the v1 source, the `newData` is represented as a logical plan,
           // while the `newData` of v2 source is just the start and end offsets. Here we return a

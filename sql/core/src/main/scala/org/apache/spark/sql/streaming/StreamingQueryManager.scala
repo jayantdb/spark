@@ -250,6 +250,9 @@ class StreamingQueryManager private[sql] (
       triggerClock: Clock,
       catalogAndIdent: Option[(TableCatalog, Identifier)] = None,
       catalogTable: Option[CatalogTable] = None): StreamingQueryWrapper = {
+
+    logInfo(s"JayantLog: createQuery")
+
     val analyzedPlan = df.queryExecution.analyzed
     df.queryExecution.assertAnalyzed()
 
@@ -270,6 +273,8 @@ class StreamingQueryManager private[sql] (
       sparkSession.sessionState.executePlan(dataStreamWritePlan).analyzed
         .asInstanceOf[WriteToStream]
 
+    logInfo(s"JayantLog: createQuery: $sink, $trigger")
+
     (sink, trigger) match {
       case (_: SupportsWrite, trigger: ContinuousTrigger) =>
         new StreamingQueryWrapper(new ContinuousExecution(
@@ -287,6 +292,7 @@ class StreamingQueryManager private[sql] (
             extraOptions,
             analyzedStreamWritePlan)
         } else {
+          logInfo(s"JayantLog: createQuery: calling MicroBatchExecution")
           new MicroBatchExecution(
             sparkSession,
             trigger,
@@ -331,6 +337,7 @@ class StreamingQueryManager private[sql] (
       triggerClock: Clock = new SystemClock(),
       catalogAndIdent: Option[(TableCatalog, Identifier)] = None,
       catalogTable: Option[CatalogTable] = None): StreamingQuery = {
+    logInfo(s"JayantLog: startQuery")
     val query = createQuery(
       userSpecifiedName,
       userSpecifiedCheckpointLocation,
