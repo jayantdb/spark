@@ -55,7 +55,7 @@ class ProgressReporter(
   extends Logging {
 
   // The timestamp we report an event that has not executed anything
-  var lastNoExecutionProgressEventTime = Long.MinValue
+  var lastNoExecutionProgressEventTime: Long = Long.MinValue
 
   val shouldValidateStateStoreCommit = new AtomicBoolean(false)
 
@@ -274,6 +274,7 @@ abstract class ProgressContext(
   def finishTrigger(
       hasNewData: Boolean,
       sourceToNumInputRowsMap: Map[SparkDataStream, Long],
+      sourceToInputSizeMap: Map[SparkDataStream, Long],
       lastExecution: IncrementalExecution,
       lastEpochId: Long): Unit = {
     assert(
@@ -292,7 +293,12 @@ abstract class ProgressContext(
     currentTriggerEndTimestamp = triggerClock.getTimeMillis()
     val processingTimeMills = currentTriggerEndTimestamp - currentTriggerStartTimestamp
     assert(lastExecution != null, "executed batch should provide the information for execution.")
-    val execStats = extractExecutionStats(hasNewData, sourceToNumInputRowsMap, lastExecution)
+    val execStats = extractExecutionStats(
+      hasNewData,
+      sourceToNumInputRowsMap,
+      sourceToInputSizeMap,
+      lastExecution
+    )
     logDebug(s"Execution stats: $execStats")
 
     val observedMetrics = extractObservedMetrics(lastExecution)
@@ -367,6 +373,7 @@ abstract class ProgressContext(
     sources.distinct.map { source =>
       val (result, duration) = Utils.timeTakenMs {
         val numRecords = execStats.flatMap(_.inputRows.get(source)).getOrElse(0L)
+        val bytesRead = execStats.flatMap(_.inputSize.get(source)).getOrElse(0L)
         val sourceMetrics = source match {
           case withMetrics: ReportsSourceMetrics =>
             withMetrics.metrics(Optional.ofNullable(latestStreamProgress.get(source).orNull))
@@ -378,6 +385,7 @@ abstract class ProgressContext(
           endOffset = currentTriggerEndOffsets.get(source).orNull,
           latestOffset = currentTriggerLatestOffsets.get(source).orNull,
           numInputRows = numRecords,
+          inputBytesRead = bytesRead,
           inputRowsPerSecond = numRecords / inputTimeSec,
           processedRowsPerSecond = numRecords / processingTimeSec,
           metrics = sourceMetrics
@@ -409,12 +417,21 @@ abstract class ProgressContext(
    * Override of finishTrigger to extract the map from IncrementalExecution.
    */
   def finishTrigger(
-      hasNewData: Boolean,
-      lastExecution: IncrementalExecution,
-      lastEpoch: Long): Unit = {
-    val map: Map[SparkDataStream, Long] =
-      if (hasNewData) extractSourceToNumInputRows(lastExecution) else Map.empty
-    finishTrigger(hasNewData, map, lastExecution, lastEpoch)
+                     hasNewData: Boolean,
+                     lastExecution: IncrementalExecution,
+                     lastEpoch: Long
+                   ): Unit = {
+    val sourceToNumInputRowsMap: Map[SparkDataStream, Long] =
+      if (hasNewData) extractSourceMetrics(lastExecution, "numOutputRows") else Map.empty
+    val sourceToInputSizeMap: Map[SparkDataStream, Long] =
+      if (hasNewData) extractSourceMetrics(lastExecution, "inputBytesRead") else Map.empty
+    finishTrigger(
+      hasNewData,
+      sourceToNumInputRowsMap,
+      sourceToInputSizeMap,
+      lastExecution,
+      lastEpoch
+    )
   }
 
   private def warnIfFinishTriggerTakesTooLong(
@@ -432,48 +449,52 @@ abstract class ProgressContext(
     }
   }
 
-  private def extractSourceToNumInputRows(
-      lastExecution: IncrementalExecution): Map[SparkDataStream, Long] = {
+  private def sumOfMetrics(
+                            tuples: Seq[(SparkDataStream, Long)]
+                          ): Map[SparkDataStream, Long] = {
+    tuples.groupBy(_._1).transform((_, v) => v.map(_._2).sum) // sum up rows for each source
+  }
 
-    def sumRows(tuples: Seq[(SparkDataStream, Long)]): Map[SparkDataStream, Long] = {
-      tuples.groupBy(_._1).transform((_, v) => v.map(_._2).sum) // sum up rows for each source
-    }
-
+  /** Extract the sources metrics for each streaming source in plan
+   * metricName: This is the metric name to be fetched from plan.
+   *
+   * Example:
+   * */
+  private def extractSourceMetrics(
+                                    lastExecution: IncrementalExecution,
+                                    metricName: String
+                                  ): Map[SparkDataStream, Long] = {
     val sources = newData.keys.toSet
 
     val sourceToInputRowsTuples = lastExecution.executedPlan
       .collect {
         case node: StreamSourceAwareSparkPlan if node.getStream.isDefined =>
-          val numRows = node.metrics.get("numOutputRows").map(_.value).getOrElse(0L)
+          val numRows = node.metrics.get(metricName).map(_.value).getOrElse(0L)
           node.getStream.get -> numRows
       }
 
     val capturedSources = sourceToInputRowsTuples.map(_._1).toSet
 
     if (sources == capturedSources) {
-      logDebug("Source -> # input rows\n\t" + sourceToInputRowsTuples.mkString("\n\t"))
-      sumRows(sourceToInputRowsTuples)
+      logDebug(s"Source -> # $metricName \n\t" + sourceToInputRowsTuples.mkString("\n\t"))
+      sumOfMetrics(sourceToInputRowsTuples)
     } else {
       // Falling back to the legacy approach to avoid any regression.
-      val inputRows = legacyExtractSourceToNumInputRows(lastExecution)
+      val lagacyMetrics = legacyExtractSourceMetrics(lastExecution, metricName)
       // If the legacy approach fails to extract the input rows, we just pick the new approach
       // as it is more likely that the source nodes have been pruned in valid reason.
-      if (inputRows.isEmpty) {
-        sumRows(sourceToInputRowsTuples)
+      if (lagacyMetrics.isEmpty) {
+        sumOfMetrics(sourceToInputRowsTuples)
       } else {
-        inputRows
+        lagacyMetrics
       }
     }
   }
 
-  /** Extract number of input sources for each streaming source in plan */
-  private def legacyExtractSourceToNumInputRows(
-      lastExecution: IncrementalExecution): Map[SparkDataStream, Long] = {
-
-    def sumRows(tuples: Seq[(SparkDataStream, Long)]): Map[SparkDataStream, Long] = {
-      tuples.groupBy(_._1).transform((_, v) => v.map(_._2).sum) // sum up rows for each source
-    }
-
+  private def legacyExtractSourceMetrics(
+                                          lastExecution: IncrementalExecution,
+                                          metricName: String
+                                        ): Map[SparkDataStream, Long] = {
     def unrollCTE(plan: LogicalPlan): LogicalPlan = {
       val containsCTE = plan.exists {
         case _: WithCTE => true
@@ -502,12 +523,12 @@ abstract class ProgressContext(
       // times in the query, we should count the numRows for each scan.
       val sourceToInputRowsTuples = lastExecution.executedPlan.collect {
         case s: MicroBatchScanExec =>
-          val numRows = s.metrics.get("numOutputRows").map(_.value).getOrElse(0L)
+          val numRows = s.metrics.get(metricName).map(_.value).getOrElse(0L)
           val source = s.stream
           source -> numRows
       }
-      logDebug("Source -> # input rows\n\t" + sourceToInputRowsTuples.mkString("\n\t"))
-      sumRows(sourceToInputRowsTuples)
+      logDebug(s"Source -> # $metricName \n\t" + sourceToInputRowsTuples.mkString("\n\t"))
+      sumOfMetrics(sourceToInputRowsTuples)
     } else {
 
       // Since V1 source do not generate execution plan leaves that directly link with source that
@@ -554,11 +575,11 @@ abstract class ProgressContext(
           case (lp, ep) =>
             logicalPlanLeafToSource.get(lp).map { source => ep -> source }
         }
-        val sourceToInputRowsTuples = execLeafToSource.map { case (execLeaf, source) =>
-          val numRows = execLeaf.metrics.get("numOutputRows").map(_.value).getOrElse(0L)
-          source -> numRows
+        val sourceToMetricsTuple = execLeafToSource.map { case (execLeaf, source) =>
+          val metrics = execLeaf.metrics.get(metricName).map(_.value).getOrElse(0L)
+          source -> metrics
         }
-        sumRows(sourceToInputRowsTuples)
+        sumOfMetrics(sourceToMetricsTuple)
       } else {
         if (!metricWarningLogged) {
           def toString[T](seq: Seq[T]): String = s"(size = ${seq.size}), ${seq.mkString(", ")}"
@@ -588,6 +609,7 @@ abstract class ProgressContext(
   private def extractExecutionStats(
       hasNewData: Boolean,
       sourceToNumInputRows: Map[SparkDataStream, Long],
+      sourceToInputSizeMap: Map[SparkDataStream, Long],
       lastExecution: IncrementalExecution): ExecutionStats = {
     val hasEventTime = progressReporter.logicalPlan().collectFirst {
       case e: EventTimeWatermark => e
@@ -604,7 +626,7 @@ abstract class ProgressContext(
     val sinkOutput = sinkCommitProgress.map(_.numOutputRows)
 
     if (!hasNewData) {
-      return ExecutionStats(Map.empty, stateOperators, watermarkTimestamp, sinkOutput)
+      return ExecutionStats(Map.empty, Map.empty, stateOperators, watermarkTimestamp, sinkOutput)
     }
 
     val eventTimeStats = lastExecution.executedPlan
@@ -617,7 +639,13 @@ abstract class ProgressContext(
             "avg" -> stats.avg.toLong).transform((_, v) => progressReporter.formatTimestamp(v))
       }.headOption.getOrElse(Map.empty) ++ watermarkTimestamp
 
-    ExecutionStats(sourceToNumInputRows, stateOperators, eventTimeStats.toMap, sinkOutput)
+    ExecutionStats(
+      sourceToNumInputRows,
+      sourceToInputSizeMap,
+      stateOperators,
+      eventTimeStats,
+      sinkOutput
+    )
   }
 
   /**
@@ -658,6 +686,7 @@ abstract class ProgressContext(
 object ProgressContext {
   case class ExecutionStats(
     inputRows: Map[SparkDataStream, Long],
+    inputSize: Map[SparkDataStream, Long],
     stateOperators: Seq[StateOperatorProgress],
     eventTimeStats: Map[String, String],
     outputRows: Option[Long])

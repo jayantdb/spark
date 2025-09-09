@@ -55,6 +55,7 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
         |  "batchDuration" : 0,
         |  "numInputRows" : 678,
         |  "inputRowsPerSecond" : 10.0,
+        |  "inputBytesRead" : 1052070,
         |  "durationMs" : {
         |    "total" : 0
         |  },
@@ -88,7 +89,8 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
         |    "endOffset" : 456,
         |    "latestOffset" : 789,
         |    "numInputRows" : 678,
-        |    "inputRowsPerSecond" : 10.0
+        |    "inputRowsPerSecond" : 10.0,
+        |    "inputBytesRead" : 1052070,
         |  } ],
         |  "sink" : {
         |    "description" : "sink",
@@ -121,6 +123,7 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
          |  "batchId" : 2,
          |  "batchDuration" : 0,
          |  "numInputRows" : 678,
+         |  "inputBytesRead" : 1052070,
          |  "durationMs" : {
          |    "total" : 0
          |  },
@@ -142,7 +145,8 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
          |    "startOffset" : 123,
          |    "endOffset" : 456,
          |    "latestOffset" : 789,
-         |    "numInputRows" : 678
+         |    "numInputRows" : 678,
+         |    "inputBytesRead" : 1052070,
          |  } ],
          |  "sink" : {
          |    "description" : "sink",
@@ -220,6 +224,7 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
           assert(s1.inputRowsPerSecond == s2.inputRowsPerSecond)
         }
         assert(s1.processedRowsPerSecond == s2.processedRowsPerSecond)
+        assert(s1.inputBytesRead == s2.inputBytesRead)
         assert(s1.metrics == s2.metrics)
       }
 
@@ -400,6 +405,31 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
     assert(data(0).getAs[Timestamp](0).equals(validValue))
   }
 
+  test("SPARK-53491: `test new code`") {
+    val resourceUrl = getClass.getResource("/structured-streaming/sample-data")
+    assert(resourceUrl != null, "Resource file not found!")
+
+    val df = spark.readStream.textFile(resourceUrl.getPath)
+    val query = df.writeStream
+      .format("memory")
+      .queryName("TestInputBytes")
+      .start()
+
+    try {
+      query.processAllAvailable()
+
+      val progress = query.lastProgress
+
+      print(progress)
+
+//      assert(progress.inputBytesRead != null)
+    } finally {
+      query.stop()
+      spark.streams.awaitAnyTermination(1000) // Waiting to allow cleaning all threads
+    }
+  }
+
+
   def waitUntilBatchProcessed: AssertOnQuery = Execute { q =>
     eventually(Timeout(streamingTimeout)) {
       if (q.exception.isEmpty) {
@@ -458,6 +488,7 @@ object StreamingQueryStatusAndProgressSuite {
         endOffset = "456",
         latestOffset = "789",
         numInputRows = 678,
+        inputBytesRead = 1052070,
         inputRowsPerSecond = 10.0,
         processedRowsPerSecond = Double.PositiveInfinity  // should not be present in the json
       )
@@ -490,7 +521,8 @@ object StreamingQueryStatusAndProgressSuite {
         latestOffset = "789",
         numInputRows = 678,
         inputRowsPerSecond = Double.NaN, // should not be present in the json
-        processedRowsPerSecond = Double.NegativeInfinity // should not be present in the json
+        processedRowsPerSecond = Double.NegativeInfinity, // should not be present in the json
+        inputBytesRead = 1052070
       )
     ),
     sink = SinkProgress("sink", None),

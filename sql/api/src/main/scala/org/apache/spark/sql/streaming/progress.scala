@@ -161,6 +161,9 @@ class StreamingQueryProgress private[spark] (
   /** The aggregate (across all sources) number of records processed in a trigger. */
   def numInputRows: Long = sources.map(_.numInputRows).sum
 
+  /** The aggregate (across all sources) bytes of records processed in a trigger. */
+  def inputBytesRead: Long = sources.map(_.inputBytesRead).sum
+
   /** The aggregate (across all sources) rate of data arriving. */
   def inputRowsPerSecond: Double = sources.map(_.inputRowsPerSecond).sum
 
@@ -185,6 +188,7 @@ class StreamingQueryProgress private[spark] (
       ("numInputRows" -> JInt(numInputRows)) ~
       ("inputRowsPerSecond" -> safeDoubleToJValue(inputRowsPerSecond)) ~
       ("processedRowsPerSecond" -> safeDoubleToJValue(processedRowsPerSecond)) ~
+      ("inputBytesRead" -> inputBytesRead) ~
       ("durationMs" -> safeMapToJValue[JLong](durationMs, v => JInt(v.toLong))) ~
       ("eventTime" -> safeMapToJValue[String](eventTime, s => JString(s))) ~
       ("stateOperators" -> JArray(stateOperators.map(_.jsonValue).toList)) ~
@@ -236,6 +240,7 @@ class SourceProgress protected[spark] (
     val endOffset: String,
     val latestOffset: String,
     val numInputRows: Long,
+    val inputBytesRead: Long,
     val inputRowsPerSecond: Double,
     val processedRowsPerSecond: Double,
     val metrics: ju.Map[String, String] = Map[String, String]().asJava)
@@ -257,6 +262,7 @@ class SourceProgress protected[spark] (
       ("numInputRows" -> JInt(numInputRows)) ~
       ("inputRowsPerSecond" -> safeDoubleToJValue(inputRowsPerSecond)) ~
       ("processedRowsPerSecond" -> safeDoubleToJValue(processedRowsPerSecond)) ~
+      ("inputBytesRead" -> inputBytesRead) ~
       ("metrics" -> safeMapToJValue[String](metrics, s => JString(s)))
   }
 
