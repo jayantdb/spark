@@ -34,6 +34,7 @@ private[protobuf] object SourceProgressSerializer {
     builder.setNumInputRows(source.numInputRows)
     builder.setInputRowsPerSecond(source.inputRowsPerSecond)
     builder.setProcessedRowsPerSecond(source.processedRowsPerSecond)
+    builder.setProcessedRowsPerSecond(source.processedRowsPerSecond)
     setJMapField(source.metrics, builder.putAllMetrics)
     builder.build()
   }
@@ -58,6 +59,7 @@ private[protobuf] object SourceProgressSerializer {
       numInputRows = source.getNumInputRows,
       inputRowsPerSecond = source.getInputRowsPerSecond,
       processedRowsPerSecond = source.getProcessedRowsPerSecond,
+      inputBytesRead = source.getInputBytesRead,
       metrics = new JHashMap(source.getMetricsMap)
     )
   }

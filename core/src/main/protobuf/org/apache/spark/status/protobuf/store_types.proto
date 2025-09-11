@@ -790,7 +790,8 @@ message SourceProgress {
   int64 num_input_rows = 5;
   double input_rows_per_second = 6;
   double processed_rows_per_second = 7;
-  map<string, string> metrics = 8;
+  int64 input_bytes_read = 8;
+  map<string, string> metrics = 9;
 }
 
 message SinkProgress {

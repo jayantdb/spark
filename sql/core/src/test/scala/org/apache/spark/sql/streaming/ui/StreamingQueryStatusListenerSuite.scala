@@ -42,8 +42,8 @@ class StreamingQueryStatusListenerSuite extends StreamTest {
   protected def useInMemoryStore: Boolean = true
 
   private val sourceProgresses = Array(
-    new SourceProgress("s1", "", "", "", 10, 4.0, 5.0),
-    new SourceProgress("s2", "", "", "", 10, 6.0, 7.0)
+    new SourceProgress("s1", "", "", "", 10, 4.0, 5.0, 1024),
+    new SourceProgress("s2", "", "", "", 10, 6.0, 7.0, 1024)
   )
 
   test("onQueryStarted, onQueryProgress, onQueryTerminated") {

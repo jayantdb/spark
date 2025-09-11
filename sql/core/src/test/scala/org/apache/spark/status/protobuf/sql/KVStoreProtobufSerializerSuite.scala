@@ -321,6 +321,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
         numInputRows = 10L,
         inputRowsPerSecond = 11.0,
         processedRowsPerSecond = 12.0,
+        inputBytesRead = 1024L,
         metrics = Map(
           "metrics-00" -> "10",
           "metrics-01" -> "11").asJava
@@ -333,6 +334,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
         numInputRows = 20L,
         inputRowsPerSecond = 21.0,
         processedRowsPerSecond = 22.0,
+        inputBytesRead = 1024L,
         metrics = Map(
           "metrics-10" -> "20",
           "metrics-11" -> "21").asJava
@@ -413,6 +415,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
         numInputRows = 10L,
         inputRowsPerSecond = 11.0,
         processedRowsPerSecond = 12.0,
+        inputBytesRead = 1024L,
         metrics = null
       )
       val source1 = new SourceProgress(
@@ -423,6 +426,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
         numInputRows = 10L,
         inputRowsPerSecond = 11.0,
         processedRowsPerSecond = 12.0,
+        inputBytesRead = 1024L,
         metrics = null
       )
       val sink = new SinkProgress(

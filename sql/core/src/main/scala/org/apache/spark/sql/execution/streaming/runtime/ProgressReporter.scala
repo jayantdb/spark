@@ -424,7 +424,7 @@ abstract class ProgressContext(
     val sourceToNumInputRowsMap: Map[SparkDataStream, Long] =
       if (hasNewData) extractSourceMetrics(lastExecution, "numOutputRows") else Map.empty
     val sourceToInputSizeMap: Map[SparkDataStream, Long] =
-      if (hasNewData) extractSourceMetrics(lastExecution, "inputBytesRead") else Map.empty
+      if (hasNewData) extractSourceMetrics(lastExecution, "filesSize") else Map.empty
     finishTrigger(
       hasNewData,
       sourceToNumInputRowsMap,
@@ -449,45 +449,64 @@ abstract class ProgressContext(
     }
   }
 
+  /**
+   * Aggregates a sequence of (SparkDataStream, Long) tuples into a Map where:
+   *   - Each unique SparkDataStream is a key.
+   *   - The corresponding value is the sum of all Long values associated with that stream.
+   *
+   * Example:
+   *   Input: Seq((DS1, 100), (DS1, 200), (DS2, 150))
+   *   Output: Map(DS1 -> 300, DS2 -> 150)
+   *
+   */
   private def sumOfMetrics(
                             tuples: Seq[(SparkDataStream, Long)]
                           ): Map[SparkDataStream, Long] = {
     tuples.groupBy(_._1).transform((_, v) => v.map(_._2).sum) // sum up rows for each source
   }
 
-  /** Extract the sources metrics for each streaming source in plan
-   * metricName: This is the metric name to be fetched from plan.
+  /**
+   * Extract the sources metrics for each streaming source from SparkPlan
+   * (e.g., numOutputRows, filesSize)
    *
-   * Example:
-   * */
+   * Steps:
+   *  1. Identify all sources involved in the current batch using `newData.keys`.
+   *  2. Traverse the executed physical plan and collect a tuple of:
+   *     (SparkDataStream -> metricValue) for each node that is aware of its streaming source.
+   *     - `metricValue` is looked up by `metricName`, defaults to 0 if missing.
+   *  3. Verify that the set of sources we captured from the plan matches the expected sources.
+   *     - If they match, summing values for each source.
+   *     - If they do not match, fall back to the legacy extraction method
+   *
+   * @param lastExecution The most recent IncrementalExecution containing the executed plan.
+   * @param metricName    The name of the metric to extract (e.g., "numOutputRows").
+   * @return A Map of SparkDataStream -> Long with aggregated metric values.
+   */
   private def extractSourceMetrics(
                                     lastExecution: IncrementalExecution,
                                     metricName: String
                                   ): Map[SparkDataStream, Long] = {
     val sources = newData.keys.toSet
 
-    val sourceToInputRowsTuples = lastExecution.executedPlan
+    val sourceToInputMetricsTuples = lastExecution.executedPlan
       .collect {
         case node: StreamSourceAwareSparkPlan if node.getStream.isDefined =>
-          val numRows = node.metrics.get(metricName).map(_.value).getOrElse(0L)
-          node.getStream.get -> numRows
+          val metricsValue = node.metrics.get(metricName).map(_.value).getOrElse(0L)
+          node.getStream.get -> metricsValue
       }
 
-    val capturedSources = sourceToInputRowsTuples.map(_._1).toSet
+    val capturedSources = sourceToInputMetricsTuples.map(_._1).toSet
 
     if (sources == capturedSources) {
-      logDebug(s"Source -> # $metricName \n\t" + sourceToInputRowsTuples.mkString("\n\t"))
-      sumOfMetrics(sourceToInputRowsTuples)
+      logDebug(s"Source -> # $metricName \n\t" + sourceToInputMetricsTuples.mkString("\n\t"))
+      sumOfMetrics(sourceToInputMetricsTuples)
     } else {
       // Falling back to the legacy approach to avoid any regression.
       val lagacyMetrics = legacyExtractSourceMetrics(lastExecution, metricName)
       // If the legacy approach fails to extract the input rows, we just pick the new approach
       // as it is more likely that the source nodes have been pruned in valid reason.
-      if (lagacyMetrics.isEmpty) {
-        sumOfMetrics(sourceToInputRowsTuples)
-      } else {
-        lagacyMetrics
-      }
+      if (lagacyMetrics.isEmpty) sumOfMetrics(sourceToInputMetricsTuples)
+      else lagacyMetrics
     }
   }
 
@@ -501,11 +520,7 @@ abstract class ProgressContext(
         case _ => false
       }
 
-      if (containsCTE) {
-        InlineCTE(alwaysInline = true).apply(plan)
-      } else {
-        plan
-      }
+      if (containsCTE) InlineCTE(alwaysInline = true).apply(plan) else plan
     }
 
     val onlyDataSourceV2Sources = {
@@ -521,14 +536,14 @@ abstract class ProgressContext(
       // It's possible that multiple DataSourceV2ScanExec instances may refer to the same source
       // (can happen with self-unions or self-joins). This means the source is scanned multiple
       // times in the query, we should count the numRows for each scan.
-      val sourceToInputRowsTuples = lastExecution.executedPlan.collect {
+      val sourceToInputMetricsTuples = lastExecution.executedPlan.collect {
         case s: MicroBatchScanExec =>
-          val numRows = s.metrics.get(metricName).map(_.value).getOrElse(0L)
+          val metricsValue = s.metrics.get(metricName).map(_.value).getOrElse(0L)
           val source = s.stream
-          source -> numRows
+          source -> metricsValue
       }
-      logDebug(s"Source -> # $metricName \n\t" + sourceToInputRowsTuples.mkString("\n\t"))
-      sumOfMetrics(sourceToInputRowsTuples)
+      logDebug(s"Source -> # $metricName \n\t" + sourceToInputMetricsTuples.mkString("\n\t"))
+      sumOfMetrics(sourceToInputMetricsTuples)
     } else {
 
       // Since V1 source do not generate execution plan leaves that directly link with source that
@@ -536,7 +551,7 @@ abstract class ProgressContext(
       // sources. This is known to fail in a few cases, see SPARK-24050.
       //
       // We want to associate execution plan leaves to sources that generate them, so that we match
-      // the their metrics (e.g. numOutputRows) to the sources. To do this we do the following.
+      // their metrics (e.g. numOutputRows) to the sources. To do this we do the following.
       // Consider the translation from the streaming logical plan to the final executed plan.
       //
       // streaming logical plan (with sources) <==> trigger's logical plan <==> executed plan
@@ -575,11 +590,11 @@ abstract class ProgressContext(
           case (lp, ep) =>
             logicalPlanLeafToSource.get(lp).map { source => ep -> source }
         }
-        val sourceToMetricsTuple = execLeafToSource.map { case (execLeaf, source) =>
-          val metrics = execLeaf.metrics.get(metricName).map(_.value).getOrElse(0L)
-          source -> metrics
+        val sourceToInputMetricsTuples = execLeafToSource.map { case (execLeaf, source) =>
+          val metricsValue = execLeaf.metrics.get(metricName).map(_.value).getOrElse(0L)
+          source -> metricsValue
         }
-        sumOfMetrics(sourceToMetricsTuple)
+        sumOfMetrics(sourceToInputMetricsTuples)
       } else {
         if (!metricWarningLogged) {
           def toString[T](seq: Seq[T]): String = s"(size = ${seq.size}), ${seq.mkString(", ")}"

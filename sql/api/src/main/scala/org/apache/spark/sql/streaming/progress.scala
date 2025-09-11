@@ -35,7 +35,7 @@ import org.json4s.jackson.JsonMethods._
 import org.apache.spark.annotation.Evolving
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
-import org.apache.spark.sql.streaming.SafeJsonSerializer.{safeDoubleToJValue, safeMapToJValue}
+import org.apache.spark.sql.streaming.SafeJsonSerializer.{safeDoubleToJValue, safeLongToJValue, safeMapToJValue}
 import org.apache.spark.sql.streaming.SinkProgress.DEFAULT_NUM_OUTPUT_ROWS
 
 /**
@@ -188,7 +188,7 @@ class StreamingQueryProgress private[spark] (
       ("numInputRows" -> JInt(numInputRows)) ~
       ("inputRowsPerSecond" -> safeDoubleToJValue(inputRowsPerSecond)) ~
       ("processedRowsPerSecond" -> safeDoubleToJValue(processedRowsPerSecond)) ~
-      ("inputBytesRead" -> inputBytesRead) ~
+      ("inputBytesRead" -> safeLongToJValue(inputBytesRead)) ~
       ("durationMs" -> safeMapToJValue[JLong](durationMs, v => JInt(v.toLong))) ~
       ("eventTime" -> safeMapToJValue[String](eventTime, s => JString(s))) ~
       ("stateOperators" -> JArray(stateOperators.map(_.jsonValue).toList)) ~
@@ -240,9 +240,9 @@ class SourceProgress protected[spark] (
     val endOffset: String,
     val latestOffset: String,
     val numInputRows: Long,
-    val inputBytesRead: Long,
     val inputRowsPerSecond: Double,
     val processedRowsPerSecond: Double,
+    val inputBytesRead: Long,
     val metrics: ju.Map[String, String] = Map[String, String]().asJava)
     extends Serializable {
 
@@ -262,7 +262,7 @@ class SourceProgress protected[spark] (
       ("numInputRows" -> JInt(numInputRows)) ~
       ("inputRowsPerSecond" -> safeDoubleToJValue(inputRowsPerSecond)) ~
       ("processedRowsPerSecond" -> safeDoubleToJValue(processedRowsPerSecond)) ~
-      ("inputBytesRead" -> inputBytesRead) ~
+      ("inputBytesRead" -> safeLongToJValue(inputBytesRead)) ~
       ("metrics" -> safeMapToJValue[String](metrics, s => JString(s)))
   }
 
@@ -322,6 +322,10 @@ private[sql] object SinkProgress {
 }
 
 private object SafeJsonSerializer {
+  def safeLongToJValue(value: Long): JValue = {
+    if (value == 0L) JNothing else org.json4s.JsonAST.JLong(value)
+  }
+
   def safeDoubleToJValue(value: Double): JValue = {
     if (value.isNaN || value.isInfinity) JNothing else JDouble(value)
   }
