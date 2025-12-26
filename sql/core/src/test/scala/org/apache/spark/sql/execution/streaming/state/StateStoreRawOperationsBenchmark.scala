@@ -37,18 +37,8 @@ import org.apache.spark.util.Utils
  * - HDFSBackedStateStoreProvider (baseline)
  * - RocksDBStateStoreProvider (current production choice)
  * - LSMTreeStateStoreProvider (new pure-Scala implementation)
- *
- * Run with:
- * {{{
- *   build/sbt "sql/testOnly *StateStoreBenchmark"
- * }}}
- *
- * Or generate benchmark results:
- * {{{
- *   SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/testOnly *StateStoreBenchmark"
- * }}}
  */
-class StateStoreBenchmark extends SparkFunSuite {
+class StateStoreRawOperationsBenchmark extends SparkFunSuite {
 
   private val keySchema = new StructType().add("key", LongType)
   private val valueSchema = new StructType().add("value", StringType)

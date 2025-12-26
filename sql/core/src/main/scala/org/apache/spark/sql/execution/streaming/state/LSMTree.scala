@@ -65,10 +65,7 @@ class LSMTree(
 
   import LSMTree._
 
-  // ============================================================================
   // Directory Structure
-  // ============================================================================
-
   private val memTableDir = new File(localRootDir, "memtable")
   private val ssTableDir = new File(localRootDir, "sstables")
   private val walDir = new File(localRootDir, "wal")
@@ -81,10 +78,7 @@ class LSMTree(
     }
   }
 
-  // ============================================================================
   // Core Components
-  // ============================================================================
-
   // Active mutable MemTable for writes
   @GuardedBy("memTableLock")
   private var activeMemTable: MemTable = new MemTable(conf.memTableSizeBytes)
@@ -129,10 +123,6 @@ class LSMTree(
 
   // Shutdown flag
   private val closed = new AtomicBoolean(false)
-
-  // ============================================================================
-  // Public API
-  // ============================================================================
 
   /**
    * Load state at the specified version.
@@ -754,7 +744,8 @@ class LSMTree(
     if (tablesToFlush.isEmpty) return
 
     val totalEntries = tablesToFlush.map(_.size).sum
-    logInfo(s"[$loggingId] FLUSH START: memTables=${tablesToFlush.length}, totalEntries=$totalEntries")
+    logInfo(s"[$loggingId] FLUSH START: " +
+      s"memTables=${tablesToFlush.length}, totalEntries=$totalEntries")
 
     var ssTableSizeBytes = 0L
     for (memTable <- tablesToFlush) {

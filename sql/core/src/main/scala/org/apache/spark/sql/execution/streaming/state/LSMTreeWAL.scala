@@ -167,7 +167,8 @@ class WriteAheadLog(
         val entriesBefore = totalEntries
         totalEntries += replayFile(file, fromVersion, toVersion, callback)
         if (totalEntries > entriesBefore) {
-          logDebug(s"[$loggingId] Replayed ${totalEntries - entriesBefore} entries from ${file.getName}")
+          logDebug(s"[$loggingId] Replayed " +
+            s"${totalEntries - entriesBefore} entries from ${file.getName}")
         }
       } catch {
         case NonFatal(e) =>
@@ -231,10 +232,6 @@ class WriteAheadLog(
       logInfo(s"[$loggingId] WAL closed")
     }
   }
-
-  // ============================================================================
-  // Internal Methods
-  // ============================================================================
 
   private def rotateWALFile(): Unit = {
     writeLock.lock()
@@ -414,6 +411,25 @@ object WriteAheadLog {
   private val MAX_FILE_SIZE: Long = 256 * 1024 * 1024 // 256 MB
 }
 
+// LSMTreeStatsCollector - PERFORMANCE METRICS
+//
+// Collects and exposes performance metrics for monitoring and debugging:
+//
+// READ METRICS:
+//   - reads: Total number of get() operations
+//   - memTableHits: Keys found in MemTable (fastest)
+//   - diskReads: Keys read from SSTables (slower)
+//
+// WRITE METRICS:
+//   - writes: Total number of put()/delete() operations
+//   - estimatedKeyCount: Approximate number of unique keys
+//
+// BLOOM FILTER METRICS:
+//   - bloomFilterChecks: Number of Bloom filter lookups
+//   - bloomFilterSkips: SSTables skipped due to Bloom filter
+//   - bloomFilterHitRatePercent: Efficiency of Bloom filters
+//
+// These metrics are exposed via Spark's StateStoreMetrics for monitoring.
 /**
  * Statistics collector for LSM-Tree.
  * Tracks read/write operations, cache hits, and performance metrics.

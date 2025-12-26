@@ -48,7 +48,7 @@ import org.apache.spark.util.{NextIterator, Utils}
  * @param sparseIndexInterval Interval for sparse index entries
  */
 case class LSMTreeConf(
-    memTableSizeBytes: Long = 64 * 1024 * 1024,  // 64 MB default
+    memTableSizeBytes: Long = 64 * 1024 * 1024,   // 64 MB default
     blockSizeBytes: Int = 4 * 1024,               // 4 KB blocks
     bloomFilterFpp: Double = 0.01,                // 1% false positive rate
     maxLevels: Int = 7,                           // Support up to 10^7 * 64MB = 640TB
@@ -116,30 +116,50 @@ private[sql] class LSMTreeStateStoreProvider
 
   import LSMTreeStateStoreProvider._
 
-  // ============================================================================
-  // State Store Instance
-  // ============================================================================
-
+  // LSMTreeStateStore - Inner Class
+  // This is the actual StateStore instance returned to Spark for each partition.
+  // It wraps the LSMTree and provides the StateStore interface (get/put/remove).
+  // Each instance operates on a specific version of the state.
   private class LSMTreeStateStore(
                                    val version: Long,
                                    readOnly: Boolean
                                  ) extends StateStore {
-
-    /** Trait and classes representing the internal state of the store */
     trait STATE
-    case object UPDATING extends STATE
-    case object COMMITTED extends STATE
-    case object ABORTED extends STATE
+    case object UPDATING extends STATE // Store is open for modifications (put/remove)
+    case object COMMITTED extends STATE // Store has been successfully committed (read-only now)
+    case object ABORTED extends STATE // Store was aborted, all pending changes rolled back
 
     @volatile private var state: STATE = UPDATING
     @volatile private var hasCommittedOnce = false
 
-    // Track modifications for this version
+    // Track modifications for this version (used for rollback on abort)
     private val pendingPuts = new ArrayBuffer[(Array[Byte], Array[Byte])]()
     private val pendingDeletes = new ArrayBuffer[Array[Byte]]()
 
+    // id: Returns the unique id for this state store partition
+    // Used by Spark to track which partition this store belongs to
     override def id: StateStoreId = LSMTreeStateStoreProvider.this.stateStoreId
 
+    // allColumnFamilyNames: Returns all column family names in this store
+    override def allColumnFamilyNames: Set[String] = lsmTree.getColumnFamilies
+
+    // createColFamilyIfAbsent: Creates a new column family if it doesn't exist
+    // Column families are like separate "tables" within the same partition
+    // Used for multi-state operations (e.g., session windows need multiple states)
+    override def createColFamilyIfAbsent(
+                                          colFamilyName: String,
+                                          keySchema: StructType,
+                                          valueSchema: StructType,
+                                          keyStateEncoderSpec: KeyStateEncoderSpec,
+                                          useMultipleValuesPerKey: Boolean = false,
+                                          isInternal: Boolean = false): Unit = {
+      if (colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME) {
+        lsmTree.createColumnFamily(colFamilyName)
+      }
+    }
+
+    // removeColFamilyIfExists: Removes a column family (logical namespace)
+    // Column families allow storing different types of state separately
     override def removeColFamilyIfExists(colFamilyName: String): Boolean = {
       if (colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME) {
         lsmTree.removeColumnFamily(colFamilyName)
@@ -148,20 +168,9 @@ private[sql] class LSMTreeStateStoreProvider
       }
     }
 
-    override def createColFamilyIfAbsent(
-        colFamilyName: String,
-        keySchema: StructType,
-        valueSchema: StructType,
-        keyStateEncoderSpec: KeyStateEncoderSpec,
-        useMultipleValuesPerKey: Boolean = false,
-        isInternal: Boolean = false): Unit = {
-      if (colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME) {
-        lsmTree.createColumnFamily(colFamilyName)
-      }
-    }
-
-    override def allColumnFamilyNames: Set[String] = lsmTree.getColumnFamilies
-
+    // get: Retrieves value for a key from state store
+    // Read path: MemTable -> Immutable MemTables -> SSTables (with Bloom filter)
+    // Returns null if key doesn't exist
     override def get(key: UnsafeRow, colFamilyName: String): UnsafeRow = {
       val keyBytes = key.getBytes
       val valueBytes = lsmTree.get(keyBytes, colFamilyName)
@@ -174,6 +183,9 @@ private[sql] class LSMTreeStateStoreProvider
       }
     }
 
+    // put: Stores a key-value pair in state store
+    // Write path: MemTable -> WAL (for durability) -> eventually SSTable
+    // Only allowed when store is in UPDATING state
     override def put(key: UnsafeRow, value: UnsafeRow, colFamilyName: String): Unit = {
       require(state == UPDATING, s"Cannot put in state $state")
       val keyBytes = key.getBytes.clone()
@@ -182,6 +194,9 @@ private[sql] class LSMTreeStateStoreProvider
       pendingPuts += ((keyBytes, valueBytes))
     }
 
+    // putList: Stores multiple values for a single key.
+    // Currently, the LSM-Tree implementation uses a single-value-per-key model.
+    // Jayant - Todo: I will implement it later. I need to understand how rocksDB has done it.
     override def putList(
         key: UnsafeRow,
         values: Array[UnsafeRow],
@@ -189,6 +204,10 @@ private[sql] class LSMTreeStateStoreProvider
       throw StateStoreErrors.unsupportedOperationException("putList", "LSMTreeStateStore")
     }
 
+    // remove: Deletes a key from state store. Only allowed when store is in UPDATING state
+    // It only writes a "tombstone" marker; actual deletion happens during compaction.
+    // I am calling soft deletes as tombstone.
+    // Its more like a common compute term to represent died object
     override def remove(key: UnsafeRow, colFamilyName: String): Unit = {
       require(state == UPDATING, s"Cannot remove in state $state")
       val keyBytes = key.getBytes.clone()
@@ -196,14 +215,13 @@ private[sql] class LSMTreeStateStoreProvider
       pendingDeletes += keyBytes
     }
 
-    override def merge(
-        key: UnsafeRow,
-        value: UnsafeRow,
-        colFamilyName: String): Unit = {
-      // For LSM-Tree, merge is implemented as put (last-write-wins)
+    // merge: Merges value with existing value for a key
+    // In LSM-Tree, implemented as simple put (last-write-wins semantics)
+    override def merge(key: UnsafeRow, value: UnsafeRow, colFamilyName: String): Unit =
       put(key, value, colFamilyName)
-    }
 
+    // mergeList: Merges list values with existing values (not supported)
+    // Todo: Will think about it in future.
     override def mergeList(
         key: UnsafeRow,
         values: Array[UnsafeRow],
@@ -211,6 +229,9 @@ private[sql] class LSMTreeStateStoreProvider
       throw StateStoreErrors.unsupportedOperationException("mergeList", "LSMTreeStateStore")
     }
 
+    // iterator: Returns iterator over all key-value pairs in the store
+    // Merges data from MemTable and all SSTable levels in sorted order
+    // Used by Spark for aggregations and state expiration
     override def iterator(colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
       val rawIterator = lsmTree.iterator(colFamilyName)
       val transformedIterator = rawIterator.map { case (keyBytes, valueBytes) =>
@@ -223,6 +244,9 @@ private[sql] class LSMTreeStateStoreProvider
       new StateStoreIterator(transformedIterator)
     }
 
+    // prefixScan: Returns iterator for keys matching a prefix
+    // Efficient for session windows and grouping operations
+    // Uses sorted order of LSM-Tree for prefix matching
     override def prefixScan(
         prefixKey: UnsafeRow,
         colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
@@ -238,12 +262,18 @@ private[sql] class LSMTreeStateStoreProvider
       new StateStoreIterator(transformedIterator)
     }
 
+    // valuesIterator: Returns iterator for multiple values per key (not supported)
+    // Todo
     override def valuesIterator(
         key: UnsafeRow,
         colFamilyName: String): Iterator[UnsafeRow] = {
       throw StateStoreErrors.unsupportedOperationException("valuesIterator", "LSMTreeStateStore")
     }
 
+    // commit: Persists all changes and creates a new version
+    // Flushes MemTable if needed, syncs WAL, reports to coordinator
+    // Transitions state from UPDATING -> COMMITTED
+    // Returns the new version number
     override def commit(): Long = {
       require(state == UPDATING, s"Cannot commit in state $state")
       val startTime = System.currentTimeMillis()
@@ -265,6 +295,12 @@ private[sql] class LSMTreeStateStoreProvider
         logInfo(s"[$stateStoreId] STORE COMMIT COMPLETE: version=$newVersion, " +
           s"puts=$putsCount, deletes=$deletesCount, duration=${duration}ms")
 
+        // Report the commit to StateStoreCoordinator for tracking
+        // This is required for batch commit validation in Spark 4.0+
+        if (storeConf.commitValidationEnabled) {
+          StateStore.reportCommitToCoordinator(newVersion, stateStoreId, hadoopConf)
+        }
+
         newVersion
       } catch {
         case e: Throwable =>
@@ -274,12 +310,16 @@ private[sql] class LSMTreeStateStoreProvider
       }
     }
 
+    // abort: Rolls back all uncommitted changes
+    // Discards pending puts/deletes, resets MemTable state
+    // Transitions state to ABORTED
     override def abort(): Unit = {
       if (state != ABORTED) {
         val putsCount = pendingPuts.size
         val deletesCount = pendingDeletes.size
 
         state = ABORTED
+
         // Rollback pending changes
         lsmTree.rollback()
         pendingPuts.clear()
@@ -290,6 +330,9 @@ private[sql] class LSMTreeStateStoreProvider
       }
     }
 
+    // metrics: Returns performance metrics for monitoring
+    // Exposed in Spark UI and available via StateStoreMetrics API
+    // Includes: numKeys, memoryUsed, memTableSize, ssTableCount, etc.
     override def metrics: StateStoreMetrics = {
       val stats = lsmTree.getStats
       StateStoreMetrics(
@@ -306,6 +349,8 @@ private[sql] class LSMTreeStateStoreProvider
       )
     }
 
+    // getStateStoreCheckpointInfo: Returns checkpoint metadata
+    // Used by Spark for checkpoint coordination and recovery
     override def getStateStoreCheckpointInfo(): StateStoreCheckpointInfo = {
       StateStoreCheckpointInfo(
         partitionId = id.partitionId,
@@ -315,29 +360,30 @@ private[sql] class LSMTreeStateStoreProvider
       )
     }
 
+    // hasCommitted: Returns true if commit() was ever called successfully
+    // Used by Spark to verify state store lifecycle
     override def hasCommitted: Boolean = hasCommittedOnce
   }
 
-  // ============================================================================
-  // Provider State
-  // ============================================================================
+  // Provider State - Instance Variables
+  // These are initialized in init() and used throughout the provider lifecycle.
+  // One provider instance is created per partition per query.
+  @volatile private var stateStoreId_ : StateStoreId = _     // Unique ID for this partition's store
+  @volatile private var keySchema: StructType = _            // Schema for state keys
+  @volatile private var valueSchema: StructType = _          // Schema for state values
+  @volatile private var storeConf: StateStoreConf = _        // General state store configuration
+  @volatile private var hadoopConf: Configuration = _        // Hadoop/HDFS configuration
+  @volatile private var lsmConf: LSMTreeConf = _             // LSM-Tree specific configuration
 
-  @volatile private var stateStoreId_ : StateStoreId = _
-  @volatile private var keySchema: StructType = _
-  @volatile private var valueSchema: StructType = _
-  @volatile private var storeConf: StateStoreConf = _
-  @volatile private var hadoopConf: Configuration = _
-  @volatile private var lsmConf: LSMTreeConf = _
+  private var fm: CheckpointFileManager = _                  // Manages checkpoint files on DFS
+  private var lsmTree: LSMTree = _                           // The actual LSM-Tree data structure
+  private var stateStoreProviderId: StateStoreProviderId = _ // Provider ID including query run ID
+  private var useColumnFamilies: Boolean = false             // Whether column families are enabled
 
-  private var fm: CheckpointFileManager = _
-  private var lsmTree: LSMTree = _
-  private var stateStoreProviderId: StateStoreProviderId = _
-  private var useColumnFamilies: Boolean = false
-
-  // ============================================================================
   // StateStoreProvider Implementation
-  // ============================================================================
-
+  // init: Called once when Spark creates the provider
+  // Sets up LSM-Tree, local directories, checkpoint manager, and configuration
+  // This is the entry point for the entire state store lifecycle
   override def init(
       stateStoreId: StateStoreId,
       keySchema: StructType,
@@ -360,17 +406,17 @@ private[sql] class LSMTreeStateStoreProvider
     val queryRunId = UUID.fromString(StateStoreProvider.getRunId(hadoopConf))
     this.stateStoreProviderId = StateStoreProviderId(stateStoreId, queryRunId)
 
-    // Initialize checkpoint file manager
+    // Initialize checkpoint file manager for DFS operations
     this.fm = CheckpointFileManager.create(
       new Path(stateStoreId.storeCheckpointLocation().toString),
       hadoopConf)
 
-    // Create local working directory for LSM-Tree
+    // Create local working directory for LSM-Tree (SSTables, WAL, etc.)
     val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
     val storeIdStr = s"LSMTree-${stateStoreId.operatorId}-${stateStoreId.partitionId}"
-    val localRootDir = Utils.createExecutorLocalTempDir(sparkConf, storeIdStr)
+    val localRootDir = Utils.createTempDir(Utils.getLocalDir(sparkConf), storeIdStr)
 
-    // Initialize the LSM-Tree
+    // Initialize the LSM-Tree with all configuration
     this.lsmTree = new LSMTree(
       localRootDir = localRootDir,
       dfsRootDir = stateStoreId.storeCheckpointLocation().toString,
@@ -390,8 +436,13 @@ private[sql] class LSMTreeStateStoreProvider
       s"walEnabled=${lsmConf.walEnabled}")
   }
 
+  // stateStoreId: Returns the unique Id for this state store partition
+  // Includes: operator ID, partition ID, store name, checkpoint location
   override def stateStoreId: StateStoreId = stateStoreId_
 
+  // getStore: Returns a writable StateStore for the given version
+  // Called by Spark at the start of each micro-batch to get state for updates
+  // Loads state from checkpoint and prepares for put/remove operations
   override def getStore(
       version: Long,
       stateStoreCkptId: Option[String] = None,
@@ -400,10 +451,14 @@ private[sql] class LSMTreeStateStoreProvider
     loadStoreInternal(version, readOnly = false, loadEmpty = loadEmpty)
   }
 
+  // getReadStore: Returns a read-only StateStore for the given version
+  // Used for state inspection without modification (e.g., UI, debugging)
   override def getReadStore(version: Long, stateStoreCkptId: Option[String]): ReadStateStore = {
     loadStoreInternal(version, readOnly = true)
   }
 
+  // loadStoreInternal: Common logic for loading a store (read or write mode)
+  // Loads LSM-Tree state from checkpoint/snapshot and creates StateStore instance
   private def loadStoreInternal(
       version: Long,
       readOnly: Boolean,
@@ -447,15 +502,20 @@ private[sql] class LSMTreeStateStoreProvider
     }
   }
 
+  // doMaintenance: Called periodically by Spark's maintenance thread
+  // Performs background tasks: compaction, cleanup of old versions
+  // Important for long-running queries to prevent unbounded disk usage
   override def doMaintenance(): Unit = {
     val startTime = System.currentTimeMillis()
     logDebug(s"[$stateStoreProviderId] MAINTENANCE START")
 
     try {
+      // Compaction: merge SSTables to reduce read amplification
       val compactionStart = System.currentTimeMillis()
       lsmTree.runCompaction()
       val compactionTime = System.currentTimeMillis() - compactionStart
 
+      // Cleanup: remove old versions beyond retention period
       val cleanupStart = System.currentTimeMillis()
       lsmTree.cleanupOldVersions(storeConf.minVersionsToRetain)
       val cleanupTime = System.currentTimeMillis() - cleanupStart
@@ -472,6 +532,8 @@ private[sql] class LSMTreeStateStoreProvider
     }
   }
 
+  // close: Called when query terminates or executor is being shut down
+  // Releases all resources: closes LSM-Tree, file handles, memory mappings
   override def close(): Unit = {
     if (lsmTree != null) {
       lsmTree.close()
@@ -482,13 +544,23 @@ private[sql] class LSMTreeStateStoreProvider
     logInfo(s"Closed LSMTreeStateStoreProvider for $stateStoreProviderId")
   }
 
+  // supportedCustomMetrics: Returns list of custom metrics this provider exposes
+  // Shown in Spark UI and available via metrics API
   override def supportedCustomMetrics: Seq[StateStoreCustomMetric] = {
     CUSTOM_METRICS
   }
 
+  // logName: Custom log name for easier debugging
+  // Includes provider ID for correlation with partition-specific logs
   override protected def logName: String = s"${super.logName} $stateStoreProviderId"
 
-  // Fine-grained replay support (SupportsFineGrainedReplay trait)
+  // SupportsFineGrainedReplay Implementation
+  // These methods enable efficient state recovery by replaying only the changes (deltas)
+  // since the last snapshot, instead of loading full state.
+
+  // replayStateFromSnapshot: Loads snapshot and replays changes up to endVersion
+  // More efficient than loading full state for each version
+  // Used during recovery after failures or restarts
   override def replayStateFromSnapshot(
       snapshotVersion: Long,
       endVersion: Long,
@@ -501,6 +573,9 @@ private[sql] class LSMTreeStateStoreProvider
     new LSMTreeStateStore(endVersion, readOnly)
   }
 
+  // getStateStoreChangeDataReader: Returns iterator over state changes
+  // Used for state change logging and incremental processing
+  // Returns (RecordType, key, value, version) tuples
   override def getStateStoreChangeDataReader(
       startVersion: Long,
       endVersion: Long,
@@ -519,9 +594,10 @@ private[sql] class LSMTreeStateStoreProvider
 
 }
 
-/**
- * Iterator for reading changelog data from LSM-Tree.
- */
+// LSMTreeChangeDataReader - Helper Class for State Change Iteration
+// This iterator reads state changes (puts and deletes) between versions.
+// Used by Spark for state change logging and incremental state inspection.
+// Returns tuples of (RecordType, keyRow, valueRow, version).
 private class LSMTreeChangeDataReader(
     lsmTree: LSMTree,
     startVersion: Long,
@@ -534,6 +610,8 @@ private class LSMTreeChangeDataReader(
   private var currentVersion = startVersion
   private var currentIterator: Iterator[(Array[Byte], Array[Byte])] = Iterator.empty
 
+  // getNext: Returns the next state change record
+  // Iterates through all versions, returning PUT or DELETE records
   override protected def getNext(): (RecordType.Value, UnsafeRow, UnsafeRow, Long) = {
     while (currentVersion <= endVersion) {
       if (currentIterator.hasNext) {
@@ -562,32 +640,48 @@ private class LSMTreeChangeDataReader(
   }
 
   override protected def close(): Unit = {
-    // No resources to close
+    // No resources to close, leaving this empty
   }
 }
 
+// LSMTreeStateStoreProvider
+// Contains constants and metric definitions shared across all provider instances.
+// These metrics are exposed in Spark UI under the Streaming tab.
 object LSMTreeStateStoreProvider {
-  // Custom metrics
+
+  // Custom Metrics - Exposed in Spark UI for monitoring LSM-Tree performance
+
+  // Tracks size of the in-memory buffer (MemTable)
+  // High values indicate more data waiting to be flushed to disk
   val METRIC_MEMTABLE_SIZE = StateStoreCustomSumMetric(
     "lsmtreeMemTableSizeBytes",
     "Size of the active MemTable in bytes")
 
+  // Counts total SSTables across all levels
+  // High count may indicate need for compaction
   val METRIC_SSTABLE_COUNT = StateStoreCustomSumMetric(
     "lsmtreeSsTableCount",
     "Number of SSTables across all levels")
 
+  // Percentage of reads that avoided disk I/O due to Bloom filter
+  // Higher is better (100% = all negative lookups caught by Bloom filter)
   val METRIC_BLOOM_FILTER_HIT_RATE = StateStoreCustomSumMetric(
     "lsmtreeBloomFilterHitRate",
     "Bloom filter hit rate (avoided disk reads)")
 
+  // Time spent in background compaction
+  // High values may indicate I/O bottleneck or large state
   val METRIC_COMPACTION_TIME_MS = StateStoreCustomTimingMetric(
     "lsmtreeCompactionTimeMs",
     "Time spent in compaction (ms)")
 
+  // Size of Write-Ahead Log files
+  // Grows between MemTable flushes, cleaned up after flush
   val METRIC_WAL_SIZE_BYTES = StateStoreCustomSumMetric(
     "lsmtreeWalSizeBytes",
     "Size of Write-Ahead Log in bytes")
 
+  // All metrics collected and exposed to Spark
   private val CUSTOM_METRICS: Seq[StateStoreCustomMetric] = Seq(
     METRIC_MEMTABLE_SIZE,
     METRIC_SSTABLE_COUNT,
@@ -597,15 +691,15 @@ object LSMTreeStateStoreProvider {
   )
 }
 
-/**
- * Statistics for the LSM-Tree.
- */
+// LSMTreeStats - Statistics Container
+// Holds a snapshot of LSM-Tree statistics at a point in time.
+// Used for metrics reporting and debugging.
 case class LSMTreeStats(
-    numKeys: Long,
-    memoryUsedBytes: Long,
-    memTableSizeBytes: Long,
-    ssTableCount: Long,
-    bloomFilterHitRate: Long,
-    lastCompactionTimeMs: Long,
-    walSizeBytes: Long
+    numKeys: Long,              // Approximate number of unique keys in store
+    memoryUsedBytes: Long,      // Total memory used by MemTable and caches
+    memTableSizeBytes: Long,    // Current size of active MemTable
+    ssTableCount: Long,         // Number of SSTables on disk
+    bloomFilterHitRate: Long,   // Bloom filter effectiveness (0-100%)
+    lastCompactionTimeMs: Long, // Duration of last compaction run
+    walSizeBytes: Long          // Current WAL size on disk
 )
