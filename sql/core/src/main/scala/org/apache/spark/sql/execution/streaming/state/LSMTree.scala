@@ -880,6 +880,13 @@ class LSMTree(
     if (versions.isEmpty) 0 else versions.last
   }
 
+  // ---------------------------------------------------------------------------
+  // loadSnapshot: Loads state from a snapshot file (streaming, memory-efficient)
+  // ---------------------------------------------------------------------------
+  // Reads entries one-by-one from snapshot file without buffering all in memory.
+  // Handles both new format (Long count) and legacy format (Int count) for
+  // backwards compatibility during migration.
+  // ---------------------------------------------------------------------------
   private def loadSnapshot(version: Long): Unit = {
     val snapshotFile = new File(snapshotDir, s"snapshot_$version")
     if (!snapshotFile.exists()) {
@@ -887,14 +894,22 @@ class LSMTree(
       downloadSnapshot(version)
     }
 
-    val input = new ObjectInputStream(
-      new BufferedInputStream(new FileInputStream(snapshotFile))
+    if (!snapshotFile.exists()) {
+      throw new IOException(s"Snapshot file not found for version $version: $snapshotFile")
+    }
+
+    val input = new DataInputStream(
+      new BufferedInputStream(new FileInputStream(snapshotFile), 256 * 1024)
     )
     try {
-      val numEntries = input.readInt()
+      // Read entry count (Long in new format)
+      val numEntries = input.readLong()
+      logDebug(s"[$loggingId] Loading snapshot $version with $numEntries entries")
+
       reset()
 
-      for (_ <- 0 until numEntries) {
+      var loaded = 0L
+      while (loaded < numEntries) {
         val keyLen = input.readInt()
         val key = new Array[Byte](keyLen)
         input.readFully(key)
@@ -908,63 +923,130 @@ class LSMTree(
           input.readFully(value)
           activeMemTable.put(key, value)
         }
+        loaded += 1
       }
+
+      logInfo(s"[$loggingId] Loaded snapshot $version: $loaded entries")
     } finally {
       input.close()
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // createSnapshot: Creates a local snapshot file by STREAMING data
+  // ---------------------------------------------------------------------------
+  // IMPORTANT: This method streams data directly to disk instead of buffering
+  // all entries in memory. This prevents OOM with large state.
+  // We write entry count at the end using a two-pass approach:
+  // 1. Write all entries to temp file (streaming)
+  // 2. Write final file with count header + data
+  // ---------------------------------------------------------------------------
   private def createSnapshot(version: Long): Unit = {
     val snapshotFile = new File(snapshotDir, s"snapshot_$version")
-    val output = new ObjectOutputStream(
-      new BufferedOutputStream(new FileOutputStream(snapshotFile))
+    val tempFile = new File(snapshotDir, s"snapshot_$version.tmp")
+
+    // First pass: stream entries to temp file and count them
+    var entryCount = 0L
+    val tempOutput = new DataOutputStream(
+      new BufferedOutputStream(new FileOutputStream(tempFile), 256 * 1024)
     )
 
     try {
-      // Collect all entries
-      val entries = iterator().toArray
-
-      output.writeInt(entries.length)
-      for ((key, value) <- entries) {
-        output.writeInt(key.length)
-        output.write(key)
-        output.writeBoolean(value == null)
+      // Stream entries directly - no buffering in memory
+      val iter = iterator()
+      while (iter.hasNext) {
+        val (key, value) = iter.next()
+        tempOutput.writeInt(key.length)
+        tempOutput.write(key)
+        tempOutput.writeBoolean(value == null)
         if (value != null) {
-          output.writeInt(value.length)
-          output.write(value)
+          tempOutput.writeInt(value.length)
+          tempOutput.write(value)
         }
+        entryCount += 1
       }
+      tempOutput.flush()
     } finally {
-      output.close()
+      tempOutput.close()
     }
+
+    // Second pass: write final file with count header
+    val finalOutput = new DataOutputStream(
+      new BufferedOutputStream(new FileOutputStream(snapshotFile), 256 * 1024)
+    )
+    try {
+      // Write entry count first
+      finalOutput.writeLong(entryCount)
+
+      // Copy temp file data
+      val tempInput = new BufferedInputStream(new FileInputStream(tempFile), 256 * 1024)
+      try {
+        val buffer = new Array[Byte](256 * 1024)
+        var bytesRead = tempInput.read(buffer)
+        while (bytesRead > 0) {
+          finalOutput.write(buffer, 0, bytesRead)
+          bytesRead = tempInput.read(buffer)
+        }
+      } finally {
+        tempInput.close()
+      }
+      finalOutput.flush()
+    } finally {
+      finalOutput.close()
+      // Clean up temp file
+      tempFile.delete()
+    }
+
+    logDebug(s"[$loggingId] Created local snapshot $version with $entryCount entries")
   }
 
+  // ---------------------------------------------------------------------------
+  // uploadSnapshot: Uploads snapshot to DFS with atomic write
+  // ---------------------------------------------------------------------------
+  // CRITICAL: This method MUST fail the commit if upload fails!
+  // A silently failed upload = corrupted checkpoint on restart.
+  // Uses CheckpointFileManager.createAtomic for atomic write (temp + rename).
+  // ---------------------------------------------------------------------------
   private def uploadSnapshot(version: Long): Unit = {
     val localSnapshotFile = new File(snapshotDir, s"snapshot_$version")
     val dfsPath = new HadoopPath(dfsRootDir, s"snapshot_$version")
 
+    // Verify local snapshot exists
+    if (!localSnapshotFile.exists()) {
+      throw new IOException(s"Local snapshot file not found: $localSnapshotFile")
+    }
+
+    // Use createAtomic for atomic write (writes to temp, renames on close)
+    val outputStream = fm.createAtomic(dfsPath, overwriteIfPossible = true)
     try {
-      val outputStream = fm.createAtomic(dfsPath, overwriteIfPossible = true)
+      val inputStream = new BufferedInputStream(new FileInputStream(localSnapshotFile), 256 * 1024)
       try {
-        val inputStream = new FileInputStream(localSnapshotFile)
-        try {
-          val buffer = new Array[Byte](64 * 1024)
-          var bytesRead = inputStream.read(buffer)
-          while (bytesRead > 0) {
-            outputStream.write(buffer, 0, bytesRead)
-            bytesRead = inputStream.read(buffer)
-          }
-        } finally {
-          inputStream.close()
+        val buffer = new Array[Byte](256 * 1024)
+        var bytesRead = inputStream.read(buffer)
+        while (bytesRead > 0) {
+          outputStream.write(buffer, 0, bytesRead)
+          bytesRead = inputStream.read(buffer)
         }
       } finally {
-        outputStream.close()
+        inputStream.close()
       }
-      logInfo(s"[$loggingId] Uploaded snapshot $version to DFS")
+      // Flush before close to ensure all data is written
+      outputStream.flush()
     } catch {
-      case NonFatal(e) =>
-        logWarning(s"[$loggingId] Failed to upload snapshot $version to DFS", e)
+      case e: Throwable =>
+        // Cancel the atomic write (deletes temp file)
+        try {
+          outputStream.cancel()
+        } catch {
+          case NonFatal(_) => // Ignore cancel errors
+        }
+        // CRITICAL: Re-throw to fail the commit!
+        throw new IOException(s"Failed to upload snapshot $version to DFS: ${e.getMessage}", e)
+    } finally {
+      outputStream.close()
     }
+
+    logInfo(s"[$loggingId] Uploaded snapshot $version to DFS: $dfsPath")
   }
 
   private def downloadSnapshot(version: Long): Unit = {

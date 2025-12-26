@@ -328,6 +328,10 @@ object SSTable extends Logging {
     )
   }
 
+  // createFromEntriesInternal: Streaming SSTable creation (memory-efficient)
+  // This method streams data directly to disk instead of buffering in memory.
+  // Memory usage is O(bloom_filter + sparse_index) regardless of data size.
+  // Uses CountingOutputStream to track byte positions without buffering.
   private def createFromEntriesInternal(
       entries: Iterator[(Array[Byte], MemTableEntry)],
       numEntries: Int,
@@ -341,14 +345,18 @@ object SSTable extends Logging {
     }
 
     val file = new File(directory, s"sstable_${UUID.randomUUID()}.sst")
-    val output = new BufferedOutputStream(new FileOutputStream(file), 64 * 1024)
+    // Use 256KB buffer for optimal sequential write performance
+    val fileOutputStream = new FileOutputStream(file)
+    val bufferedOutput = new BufferedOutputStream(fileOutputStream, 256 * 1024)
+    // CountingOutputStream tracks bytes written without buffering
+    val countingOutput = new CountingOutputStream(bufferedOutput)
+    val dataOutput = new DataOutputStream(countingOutput)
 
     try {
-      // Build Bloom filter and collect entries
+      // Build Bloom filter incrementally (memory: ~1.2 bytes per key at 1% FPP)
       val bloomFilter = LSMBloomFilter(numEntries, bloomFilterFpp)
+      // Sparse index entries (memory: ~24 bytes per entry, one per sparseIndexInterval keys)
       val sparseIndex = new SparseIndex()
-      val dataBuffer = new ByteArrayOutputStream()
-      val dataOutput = new DataOutputStream(dataBuffer)
 
       var currentBlockSize = 0
       var currentBlockEntries = 0
@@ -359,41 +367,42 @@ object SSTable extends Logging {
       var entryCount = 0L
       var indexCounter = 0
 
+      // Stream entries directly to disk - no buffering of data
       for ((key, entry) <- entries) {
-        // Update min/max keys
+        // Update min/max keys (only clone first and last)
         if (minKey == null) minKey = key.clone()
-        maxKey = key.clone()
+        maxKey = key // Will clone at the end
 
-        // Add to Bloom filter
+        // Add to Bloom filter (O(k) hash operations, k = number of hash functions)
         bloomFilter.put(key)
 
-        // Calculate entry size
+        // Calculate entry size for block management
         val entrySize = 4 + key.length + 4 +
           (if (entry.value != null) entry.value.length else 0) + 1 + 8
 
         // Start new block if current is too large
         if (currentBlockSize + entrySize > blockSize && currentBlockEntries > 0) {
-          // Finalize current block
+          // Record block boundary in sparse index
           sparseIndex.addEntry(firstKeyInBlock, currentBlockStart)
-          currentBlockStart = dataBuffer.size()
+          currentBlockStart = countingOutput.getBytesWritten
           currentBlockSize = 0
           currentBlockEntries = 0
           firstKeyInBlock = null
         }
 
-        // First entry in block
+        // First entry in block - record for sparse index
         if (firstKeyInBlock == null) {
           firstKeyInBlock = key.clone()
         }
 
-        // Write entry
+        // Write entry directly to disk (through buffer)
         dataOutput.writeInt(key.length)
         dataOutput.write(key)
         if (entry.value != null) {
           dataOutput.writeInt(entry.value.length)
           dataOutput.write(entry.value)
         } else {
-          dataOutput.writeInt(-1)
+          dataOutput.writeInt(-1) // Tombstone marker
         }
         dataOutput.writeByte(if (entry.isDeleted) 1 else 0)
         dataOutput.writeLong(entry.sequenceNumber)
@@ -405,7 +414,7 @@ object SSTable extends Logging {
         // Add to sparse index at intervals
         indexCounter += 1
         if (indexCounter >= sparseIndexInterval) {
-          sparseIndex.addEntry(key.clone(), currentBlockStart)
+          sparseIndex.addEntry(key.clone(), countingOutput.getBytesWritten)
           indexCounter = 0
         }
       }
@@ -415,23 +424,23 @@ object SSTable extends Logging {
         sparseIndex.addEntry(firstKeyInBlock, currentBlockStart)
       }
 
+      // Clone maxKey now (we only kept reference during iteration)
+      maxKey = maxKey.clone()
+
+      // Flush data section and record size
       dataOutput.flush()
-      val dataBytes = dataBuffer.toByteArray
+      val dataSize = countingOutput.getBytesWritten
 
-      // Write data section
-      output.write(dataBytes)
-      val dataSize = dataBytes.length.toLong
-
-      // Write Bloom filter
+      // Write Bloom filter (serialized, typically small)
       val bloomBytes = bloomFilter.toBytes()
-      output.write(bloomBytes)
+      bufferedOutput.write(bloomBytes)
 
-      // Write sparse index
+      // Write sparse index (serialized, typically small)
       val indexBytes = sparseIndex.toBytes()
-      output.write(indexBytes)
+      bufferedOutput.write(indexBytes)
 
-      // Write footer
-      val footerOutput = new DataOutputStream(output)
+      // Write footer with metadata
+      val footerOutput = new DataOutputStream(bufferedOutput)
       footerOutput.writeInt(MAGIC_NUMBER)
       footerOutput.writeInt(VERSION)
       footerOutput.writeLong(dataSize)
@@ -444,7 +453,7 @@ object SSTable extends Logging {
       footerOutput.write(maxKey)
 
       footerOutput.flush()
-      output.flush()
+      bufferedOutput.flush()
 
       new SSTable(
         file,
@@ -457,7 +466,8 @@ object SSTable extends Logging {
       )
 
     } finally {
-      output.close()
+      // Close all streams (closing outer stream closes inner ones)
+      bufferedOutput.close()
     }
   }
 
@@ -1040,4 +1050,45 @@ object SparseIndex {
 
     index
   }
+}
+
+// =============================================================================
+// CountingOutputStream - Tracks bytes written without buffering
+// =============================================================================
+// A lightweight wrapper that counts bytes written to the underlying stream.
+// Used during SSTable creation to track file positions without buffering
+// all data in memory. Zero overhead - just increments a counter.
+// =============================================================================
+
+/**
+ * An OutputStream wrapper that counts bytes written.
+ * This allows tracking file position without buffering data in memory.
+ *
+ * @param out The underlying output stream to write to
+ */
+private[state] class CountingOutputStream(out: OutputStream) extends OutputStream {
+
+  private var bytesWritten: Long = 0L
+
+  /** Get the total number of bytes written so far */
+  def getBytesWritten: Long = bytesWritten
+
+  override def write(b: Int): Unit = {
+    out.write(b)
+    bytesWritten += 1
+  }
+
+  override def write(b: Array[Byte]): Unit = {
+    out.write(b)
+    bytesWritten += b.length
+  }
+
+  override def write(b: Array[Byte], off: Int, len: Int): Unit = {
+    out.write(b, off, len)
+    bytesWritten += len
+  }
+
+  override def flush(): Unit = out.flush()
+
+  override def close(): Unit = out.close()
 }
