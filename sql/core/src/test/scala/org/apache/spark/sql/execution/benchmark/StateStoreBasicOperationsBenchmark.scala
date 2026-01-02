@@ -26,7 +26,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.runtime.StreamExecution
-import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, NoPrefixKeyStateEncoderSpec, RocksDBStateStoreProvider, StateStore, StateStoreConf, StateStoreId, StateStoreProvider}
+import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, LSMTreeStateStoreProvider, NoPrefixKeyStateEncoderSpec, RocksDBStateStoreProvider, StateStore, StateStoreConf, StateStoreId, StateStoreProvider}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType, TimestampType}
 import org.apache.spark.util.Utils
@@ -94,11 +94,13 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
         val inMemoryProvider = newHDFSBackedStateStoreProvider()
         val rocksDBProvider = newRocksDBStateProvider()
         val rocksDBWithNoTrackProvider = newRocksDBStateProvider(trackTotalNumberOfRows = false)
+        val lsmTreeProvider = newLSMTreeStateProvider()
 
         val committedInMemoryVersion = loadInitialData(inMemoryProvider, testData)
         val committedRocksDBVersion = loadInitialData(rocksDBProvider, testData)
         val committedRocksDBWithNoTrackVersion = loadInitialData(
           rocksDBWithNoTrackProvider, testData)
+        val committedLSMTreeVersion = loadInitialData(lsmTreeProvider, testData)
 
         overwriteRates.foreach { overwriteRate =>
           val numOfRowsToOverwrite = numOfRow * overwriteRate / 100
@@ -127,6 +129,8 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
             rocksDBProvider, committedRocksDBVersion, rowsToPut)
           registerPutBenchmarkCase(benchmark, "RocksDB (trackTotalNumberOfRows: false)",
             rocksDBWithNoTrackProvider, committedRocksDBWithNoTrackVersion, rowsToPut)
+          registerPutBenchmarkCase(benchmark, "LSMTree", lsmTreeProvider,
+            committedLSMTreeVersion, rowsToPut)
 
           benchmark.run()
         }
@@ -134,6 +138,7 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
         inMemoryProvider.close()
         rocksDBProvider.close()
         rocksDBWithNoTrackProvider.close()
+        lsmTreeProvider.close()
       }
     }
   }
@@ -241,11 +246,13 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
         val inMemoryProvider = newHDFSBackedStateStoreProvider()
         val rocksDBProvider = newRocksDBStateProvider()
         val rocksDBWithNoTrackProvider = newRocksDBStateProvider(trackTotalNumberOfRows = false)
+        val lsmTreeProvider = newLSMTreeStateProvider()
 
         val committedInMemoryVersion = loadInitialData(inMemoryProvider, testData)
         val committedRocksDBVersion = loadInitialData(rocksDBProvider, testData)
         val committedRocksDBWithNoTrackVersion = loadInitialData(
           rocksDBWithNoTrackProvider, testData)
+        val committedLSMTreeVersion = loadInitialData(lsmTreeProvider, testData)
 
         nonExistRates.foreach { nonExistRate =>
           val numOfRowsNonExist = numOfRow * nonExistRate / 100
@@ -275,6 +282,8 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
             rocksDBProvider, committedRocksDBVersion, keysToDelete)
           registerDeleteBenchmarkCase(benchmark, "RocksDB (trackTotalNumberOfRows: false)",
             rocksDBWithNoTrackProvider, committedRocksDBWithNoTrackVersion, keysToDelete)
+          registerDeleteBenchmarkCase(benchmark, "LSMTree", lsmTreeProvider,
+            committedLSMTreeVersion, keysToDelete)
 
           benchmark.run()
         }
@@ -282,6 +291,7 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
         inMemoryProvider.close()
         rocksDBProvider.close()
         rocksDBWithNoTrackProvider.close()
+        lsmTreeProvider.close()
       }
     }
   }
@@ -318,11 +328,13 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
         val inMemoryProvider = newHDFSBackedStateStoreProvider()
         val rocksDBProvider = newRocksDBStateProvider()
         val rocksDBWithNoTrackProvider = newRocksDBStateProvider(trackTotalNumberOfRows = false)
+        val lsmTreeProvider = newLSMTreeStateProvider()
 
         val committedInMemoryVersion = loadInitialData(inMemoryProvider, testData)
         val committedRocksDBVersion = loadInitialData(rocksDBProvider, testData)
         val committedRocksDBWithNoTrackVersion = loadInitialData(
           rocksDBWithNoTrackProvider, testData)
+        val committedLSMTreeVersion = loadInitialData(lsmTreeProvider, testData)
 
         numOfEvictionRates.foreach { numOfEvictionRate =>
           val numOfRowsToEvict = numOfRow * numOfEvictionRate / 100
@@ -346,12 +358,16 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
             rocksDBWithNoTrackProvider, committedRocksDBWithNoTrackVersion,
             maxTimestampToEvictInMillis, numOfRowsToEvict)
 
+          registerEvictBenchmarkCase(benchmark, "LSMTree", lsmTreeProvider,
+            committedLSMTreeVersion, maxTimestampToEvictInMillis, numOfRowsToEvict)
+
           benchmark.run()
         }
 
         inMemoryProvider.close()
         rocksDBProvider.close()
         rocksDBWithNoTrackProvider.close()
+        lsmTreeProvider.close()
       }
     }
   }
@@ -493,6 +509,21 @@ object StateStoreBasicOperationsBenchmark extends SqlBasedBenchmark {
       storeId, keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
       useColumnFamilies = useColumnFamilies, storeConf, configuration,
       useMultipleValuesPerKey = useMultipleValuesPerKey)
+    provider
+  }
+
+  private def newLSMTreeStateProvider(): StateStoreProvider = {
+    val storeId = StateStoreId(newDir(), Random.nextInt(), 0)
+    val provider = new LSMTreeStateStoreProvider()
+    val sqlConf = new SQLConf()
+    val storeConf = new StateStoreConf(sqlConf)
+
+    val configuration = new Configuration
+    configuration.set(StreamExecution.RUN_ID_KEY, UUID.randomUUID().toString)
+
+    provider.init(
+      storeId, keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
+      useColumnFamilies = false, storeConf, configuration)
     provider
   }
 
