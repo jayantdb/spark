@@ -605,7 +605,7 @@ class LSMTree(
   // This is called in background to avoid blocking writes
   def runCompaction(): Unit = {
     val startTime = System.currentTimeMillis()
-    val levelSizesBefore = levels.map(_.size).toArray
+    val levelSizesBefore = levels.map(_.size)
 
     logDebug(s"[$loggingId] COMPACTION START: levelSizes=${levelSizesBefore.mkString(",")}")
 
@@ -636,7 +636,8 @@ class LSMTree(
     }
 
     val duration = System.currentTimeMillis() - startTime
-    val levelSizesAfter = levels.map(_.size).toArray
+    val levelSizesAfter = levels.map(_.size)
+
     stats.recordCompactionTime(duration)
 
     logInfo(s"[$loggingId] COMPACTION COMPLETE: duration=${duration}ms, " +

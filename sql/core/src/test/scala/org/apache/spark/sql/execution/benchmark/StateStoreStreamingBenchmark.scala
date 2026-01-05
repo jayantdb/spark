@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql.execution.streaming.state
+package org.apache.spark.sql.execution.benchmark
 
 import java.io.File
 import java.sql.Timestamp
@@ -67,8 +67,8 @@ case class BenchmarkResult(
 /**
  * Real Streaming Benchmark Suite for StateStore implementations.
  *
- * This benchmark tests HDFS, RocksDB, and LSMTree StateStores with actual
- * Spark Structured Streaming queries including:
+ * This benchmark tests HDFS, RocksDB, and LSMTree StateStores with actual Streaming queries
+ * including:
  * - Windowed aggregations
  * - Stateful operations (flatMapGroupsWithState)
  * - Stream deduplication

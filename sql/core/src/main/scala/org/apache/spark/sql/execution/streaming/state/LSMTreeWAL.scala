@@ -31,9 +31,10 @@ import org.apache.spark.internal.Logging
 /**
  * Write-Ahead Log (WAL) for LSM-Tree durability.
  *
- * The WAL ensures durability by writing all operations to disk before
- * they are applied to the MemTable. In case of failure, the WAL can be
- * replayed to recover uncommitted data.
+ * The WAL ensures durability by writing all operations to disk before they are
+ * applied to the MemTable.
+ *
+ * In case of failure, the WAL can be replayed to recover uncommitted data.
  *
  * WAL file format:
  * {{{
@@ -55,16 +56,15 @@ import org.apache.spark.internal.Logging
  */
 @ThreadSafe
 class WriteAheadLog(
-    directory: File,
-    loggingId: String) extends Closeable with Logging {
+                     directory: File,
+                     loggingId: String
+                   ) extends Closeable with Logging {
 
   import WriteAheadLog._
   import WALOperation._
 
   // Ensure directory exists
-  if (!directory.exists()) {
-    directory.mkdirs()
-  }
+  if (!directory.exists()) directory.mkdirs()
 
   // Current WAL file and streams
   @volatile private var currentFile: File = _
@@ -87,15 +87,12 @@ class WriteAheadLog(
   // Initialize with a new WAL file
   rotateWALFile()
 
-  /**
-   * Append an operation to the WAL.
-   */
+  // Append an operation to the WAL
   def append(operation: WALOperation, key: Array[Byte], value: Array[Byte]): Long = {
-    if (closed.get()) {
-      throw new IllegalStateException("WAL is closed")
-    }
+    if (closed.get()) throw new IllegalStateException("WAL is closed")
 
     writeLock.lock()
+
     try {
       val seq = sequenceNumber.incrementAndGet()
       val record = encodeRecord(operation, key, value, seq)
@@ -104,9 +101,7 @@ class WriteAheadLog(
       totalSize.addAndGet(record.length)
 
       // Rotate if file is too large (256 MB per file)
-      if (totalSize.get() > MAX_FILE_SIZE) {
-        rotateWALFile()
-      }
+      if (totalSize.get() > MAX_FILE_SIZE) rotateWALFile()
 
       seq
     } finally {
@@ -114,13 +109,12 @@ class WriteAheadLog(
     }
   }
 
-  /**
-   * Sync WAL to disk.
-   */
+  // Sync WAL to disk
   def sync(): Unit = {
     if (closed.get()) return
 
     writeLock.lock()
+
     try {
       if (outputStream != null) {
         outputStream.flush()
@@ -132,14 +126,12 @@ class WriteAheadLog(
     }
   }
 
-  /**
-   * Truncate WAL to last committed position.
-   */
+  // Truncate WAL to last committed position
   def truncate(): Unit = {
     writeLock.lock()
+
     try {
-      // For simplicity, we just rotate to a new file
-      // In a production system, you'd truncate the current file
+      // Closing the current WAL file and start a new one.
       rotateWALFile()
       sequenceNumber.set(commitSequence.get())
     } finally {
@@ -147,13 +139,11 @@ class WriteAheadLog(
     }
   }
 
-  /**
-   * Replay WAL records in a version range.
-   */
+  // Replay WAL records in a version range
   def replay(
-      fromVersion: Long,
-      toVersion: Long)(
-      callback: (WALOperation, Array[Byte], Array[Byte]) => Unit): Unit = {
+              fromVersion: Long,
+              toVersion: Long
+            )(callback: (WALOperation, Array[Byte], Array[Byte]) => Unit): Unit = {
 
     val startTime = System.currentTimeMillis()
     val walFiles = getWALFiles.sortBy(_.getName)
@@ -180,11 +170,10 @@ class WriteAheadLog(
     logInfo(s"[$loggingId] WAL REPLAY COMPLETE: entries=$totalEntries, duration=${duration}ms")
   }
 
-  /**
-   * Clean up old WAL files.
-   */
+  // Clean up old WAL files
   def cleanup(minVersionToKeep: Long): Unit = {
     writeLock.lock()
+
     try {
       val walFiles = getWALFiles
       for (file <- walFiles) {
@@ -206,12 +195,8 @@ class WriteAheadLog(
     }
   }
 
-  /**
-   * Get total WAL size.
-   */
-  def size: Long = {
-    getWALFiles.map(_.length()).sum
-  }
+  // Get total WAL size
+  def size: Long = { getWALFiles.map(_.length()).sum }
 
   override def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
@@ -235,6 +220,7 @@ class WriteAheadLog(
 
   private def rotateWALFile(): Unit = {
     writeLock.lock()
+
     try {
       // Close current file
       if (outputStream != null) {
@@ -248,8 +234,8 @@ class WriteAheadLog(
       // Create new file
       val timestamp = System.currentTimeMillis()
       val seq = sequenceNumber.get()
-      currentFile = new File(directory, f"wal_${timestamp}_$seq%020d.log")
 
+      currentFile = new File(directory, f"wal_${timestamp}_$seq%020d.log")
       fileOutputStream = new FileOutputStream(currentFile, false)
       outputStream = new DataOutputStream(new BufferedOutputStream(fileOutputStream, 64 * 1024))
 
@@ -268,14 +254,24 @@ class WriteAheadLog(
   }
 
   private def encodeRecord(
-      operation: WALOperation,
-      key: Array[Byte],
-      value: Array[Byte],
-      seq: Long): Array[Byte] = {
+                            operation: WALOperation,
+                            key: Array[Byte],
+                            value: Array[Byte],
+                            seq: Long
+                          ): Array[Byte] = {
 
     val valueLen = if (value != null) value.length else -1
-    val recordSize = 1 + 4 + key.length + 4 +
-      (if (value != null) value.length else 0) + 8 + 4
+
+    // recordSize is fetched from WAL format:
+    // Read in sequence -
+    // - Operation type (1 byte: PUT=1, DELETE=2)
+    // - Key length (4 bytes)
+    // - Key bytes (variable)
+    // - Value length (4 bytes, -1 if null)
+    // - Value bytes (variable)
+    // - Sequence number (8 bytes)
+    // - CRC checksum (4 bytes)
+    val recordSize = 1 + 4 + key.length + 4 + (if (value != null) value.length else 0) + 8 + 4
 
     val buffer = ByteBuffer.allocate(4 + recordSize)
 
@@ -288,9 +284,7 @@ class WriteAheadLog(
     buffer.putInt(key.length)
     buffer.put(key)
     buffer.putInt(valueLen)
-    if (value != null) {
-      buffer.put(value)
-    }
+    if (value != null) buffer.put(value)
     buffer.putLong(seq)
 
     // CRC32
@@ -301,72 +295,103 @@ class WriteAheadLog(
     buffer.array()
   }
 
+  // Reads a WAL file and re applies operations to restore state after crash
+  //
+  // Each record: [Op][KeyLen][Key][ValueLen][Value][SeqNum][CRC]
+  //
+  // @param file        The WAL file to replay
+  // @param fromVersion Only replay records with seq > fromVersion
+  // @param toVersion   Only replay records with seq <= toVersion
+  // @param callback    Function to call for each replayed record (applies PUT/DELETE)
+  // @return Number of entries successfully replayed
   private def replayFile(
-      file: File,
-      fromVersion: Long,
-      toVersion: Long,
-      callback: (WALOperation, Array[Byte], Array[Byte]) => Unit): Long = {
+                          file: File,
+                          fromVersion: Long,
+                          toVersion: Long,
+                          callback: (WALOperation, Array[Byte], Array[Byte]) => Unit
+                        ): Long = {
 
-    val input = new DataInputStream(
-      new BufferedInputStream(new FileInputStream(file), 64 * 1024))
+    // Open file with 64KB buffer for efficient sequential reads
+    val input = new DataInputStream(new BufferedInputStream(new FileInputStream(file), 64 * 1024))
 
     var entriesReplayed = 0L
 
     try {
-      // Read header
+      // Step 1: Validate file header (ensures this is a valid WAL file)
       val magic = input.readInt()
+
       if (magic != MAGIC_NUMBER) {
         throw new IOException(s"Invalid WAL magic number: $magic")
       }
 
       val version = input.readInt()
+
       if (version != VERSION) {
+        // WAL format has changed, can't read files from different versions
         throw new IOException(s"Unsupported WAL version: $version")
       }
 
-      // Read records
+      // Step 2: Read records one by one until end of file
       var continue = true
+
       while (input.available() > 0 && continue) {
+        // First 4 bytes tell us how big the next record is
         val recordLen = input.readInt()
+
         if (recordLen <= 0) {
+          // Invalid length means file might be truncated (crash during write)
           continue = false
         } else {
+          // Read the entire record into memory
           val recordData = new Array[Byte](recordLen)
           input.readFully(recordData)
 
+          // Wrap in ByteBuffer for easy field extraction
           val record = ByteBuffer.wrap(recordData)
 
+          // Parse record fields in order they were written:
+          // 1. Operation type (PUT=1, DELETE=2)
           val opByte = record.get()
           val operation = WALOperation(opByte.toInt)
 
+          // 2. Key: [length][bytes]
           val keyLen = record.getInt()
           val key = new Array[Byte](keyLen)
           record.get(key)
 
+          // 3. Value: [length][bytes] - length=-1 means null (tombstone)
           val valueLen = record.getInt()
           val value = if (valueLen >= 0) {
             val v = new Array[Byte](valueLen)
             record.get(v)
             v
           } else {
-            null
+            null // Tombstone - this key was deleted
           }
 
+          // 4. Sequence number - tells us which batch this belongs to
           val seq = record.getLong()
+
+          // 5. CRC checksum - last 4 bytes for integrity verification
           val storedCrc = record.getInt()
 
-          // Verify CRC
+          // Step 3: Verify data integrity using CRC
+          // CRC covers everything except itself (recordLen - 4 bytes)
           val crc = new CRC32()
           crc.update(recordData, 0, recordLen - 4)
+
           if (crc.getValue.toInt != storedCrc) {
+            // Data corruption detected! Skip this record but continue
+            // This can happen if crash occurred mid-write
             logWarning(s"[$loggingId] CRC mismatch in WAL record, seq=$seq")
-            // Skip this record, continue to next
           } else {
-            // Apply if in version range
+            // Step 4: Apply record if it's in the requested version range
+            // Example: fromVersion=5, toVersion=10 means replay batches 6,7,8,9,10
             if (seq > fromVersion && seq <= toVersion) {
-              callback(operation, key, value)
+              callback(operation, key, value) // Apply PUT or DELETE to MemTable
               entriesReplayed += 1
             }
+            // Records outside range are skipped (already applied or not needed)
           }
         }
       }
@@ -411,7 +436,7 @@ object WriteAheadLog {
   private val MAX_FILE_SIZE: Long = 256 * 1024 * 1024 // 256 MB
 }
 
-// LSMTreeStatsCollector - PERFORMANCE METRICS
+// LSMTreeStatsCollector - performance metrics
 //
 // Collects and exposes performance metrics for monitoring and debugging:
 //
@@ -465,8 +490,6 @@ class LSMTreeStatsCollector {
   def writes: Long = _writes.get()
   def memTableHits: Long = _memTableHits.get()
   def diskReads: Long = _diskReads.get()
-  def bloomFilterChecks: Long = _bloomFilterChecks.get()
-  def bloomFilterSkips: Long = _bloomFilterSkips.get()
   def estimatedKeyCount: Long = _estimatedKeyCount.get()
   def bloomFilterMemory: Long = _bloomFilterMemory.get()
   def lastCompactionTimeMs: Long = _lastCompactionTimeMs.get()
@@ -483,7 +506,7 @@ class LSMTreeStatsCollector {
    */
   def summary: String = {
     s"reads=$reads, writes=$writes, memTableHits=$memTableHits, diskReads=$diskReads, " +
-      s"bloomFilterHitRate=${bloomFilterHitRatePercent}%"
+      s"bloomFilterHitRate=$bloomFilterHitRatePercent%"
   }
 
   /**

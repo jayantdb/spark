@@ -34,6 +34,10 @@ import org.apache.spark.util.Utils
 
 /**
  * Tests for the LSM-Tree based StateStore implementation.
+ * Execute:
+ * ./build/mvn -pl sql/core \
+ * -am test \
+ * -DwildcardSuites=org.apache.spark.sql.execution.streaming.state.LSMTreeStateStoreSuite
  */
 class LSMTreeStateStoreSuite extends SparkFunSuite with BeforeAndAfter {
 
