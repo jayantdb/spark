@@ -29,54 +29,75 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.internal.Logging
 
 /**
- * SSTable (Sorted String Table) - An immutable, sorted, disk-based table.
+ * SSTable (Sorted String Table) - An immutable, sorted, disk-based key-value table.
+ * An SSTable is a fundamental building block of the LSM-Tree architecture.
+ * Once written, an SSTable is never modified - all updates create new SSTables. This immutability
+ * enables safe concurrent reads without locks and simplifies crash recovery.
  *
- * File format:
- * {{{
- *   +------------------+
- *   | Data Blocks      |   <- Variable size blocks of sorted key-value pairs
- *   +------------------+
- *   | Bloom Filter     |   <- Probabilistic filter for fast negative lookups
- *   +------------------+
- *   | Sparse Index     |   <- Index pointing to data blocks
- *   +------------------+
- *   | Footer           |   <- Metadata (offsets, sizes, etc.)
- *   +------------------+
- * }}}
+ * FILE STRUCTURE:
+ * The SSTable file is organized into four sequential sections:
+ *   - Data Blocks: The bulk of the file containing sorted key-value pairs. Each block
+ *     holds multiple entries up to a configurable size limit. Keys within each block
+ *     are sorted, and blocks themselves are sorted relative to each other.
  *
+ *   - Bloom Filter: A probabilistic data structure that quickly answers "might this key
+ *     exist?" questions. If the Bloom filter says "no", the key is definitely not in
+ *     this SSTable, avoiding unnecessary disk reads. False positives are possible but
+ *     rare (configurable, typically 1%).
+ *
+ *   - Sparse Index: A lookup table mapping sampled keys to their block offsets. Instead
+ *     of indexing every key, we record one key per N entries (the sparse index interval).
+ *     Binary search on this index quickly locates the correct block.
+ *
+ *   - Footer: Fixed-size metadata including magic number, version, data size, Bloom
+ *     filter size, sparse index size, entry count, and min/max keys.
+ *
+ * DATA BLOCK ENTRY FORMAT:
  * Data Block format:
  * {{{
- *   | Num Entries (4 bytes) |
- *   | Entry 1: key_len (4) | key | value_len (4) | value | deleted (1) | seq (8) |
- *   | Entry 2: ... |
- *   | CRC32 (4 bytes) |
+ *    | Num Entries (4 bytes) |
+ *    | Entry 1: key_len (4) | key | value_len (4) | value | deleted (1) | seq (8) |
+ *    | Entry 2: ... |
+ *    | CRC32 (4 bytes) |
  * }}}
+ * Each entry within a data block contains:
+ *   - key_length (4 bytes): Length of the key in bytes
+ *   - key (variable): The actual key bytes
+ *   - value_length (4 bytes): Length of the value, or -1 for tombstones (deleted keys)
+ *   - value (variable): The actual value bytes (absent for tombstones)
+ *   - deleted (1 byte): 1 if this entry is a tombstone, 0 otherwise
+ *   - sequence_number (8 bytes): Monotonically increasing number for ordering updates
  *
- * @param file Path to the SSTable file
- * @param dataSize Size of the data section
- * @param bloomFilter The Bloom filter for this SSTable
- * @param sparseIndex The sparse index for this SSTable
- * @param minKey Minimum key in this SSTable
- * @param maxKey Maximum key in this SSTable
- * @param numEntries Total number of entries
+ * @param file        Path to the SSTable file on disk
+ * @param dataSize    Size of the data blocks section in bytes (used for memory mapping)
+ * @param bloomFilter The Bloom filter for fast negative lookups
+ * @param sparseIndex The sparse index for block-level binary search
+ * @param minKey      The smallest key in this SSTable (for range filtering)
+ * @param maxKey      The largest key in this SSTable (for range filtering)
+ * @param numEntries  Total count of key-value entries in this SSTable
  */
 @ThreadSafe
-class SSTable private[state] (
-    val file: File,
-    val dataSize: Long,
-    private val bloomFilter: LSMBloomFilter,
-    private[state] val sparseIndex: SparseIndex,
-    val minKey: Array[Byte],
-    val maxKey: Array[Byte],
-    val numEntries: Long) extends Closeable with Logging {
+class SSTable private[state](
+                              val file: File,
+                              val dataSize: Long,
+                              private val bloomFilter: LSMBloomFilter,
+                              private[state] val sparseIndex: SparseIndex,
+                              val minKey: Array[Byte],
+                              val maxKey: Array[Byte],
+                              val numEntries: Long
+                            ) extends Closeable with Logging {
 
   import LSMTree.compareByteArrays
 
-  // Memory-mapped file for fast reads
+  // Memory-mapped buffer for fast random reads. Memory mapping allows the OS to manage
+  // which portions of the file are loaded into RAM, avoiding explicit read() calls and
+  // enabling the OS page cache to optimize access patterns.
   @volatile private var mappedBuffer: MappedByteBuffer = _
   @volatile private var fileChannel: FileChannel = _
 
-  // Lazy initialization of memory mapping
+  // Lazily initializes the memory mapping on first access. This avoids mapping files
+  // that are never actually read (e.g., filtered out by Bloom filter or key range).
+  // Thread-safe via double-checked locking.
   private def ensureMapped(): MappedByteBuffer = {
     if (mappedBuffer == null) {
       synchronized {
@@ -94,46 +115,66 @@ class SSTable private[state] (
   }
 
   /**
-   * Check if this SSTable might contain the key (using Bloom filter).
+   * Checks if this SSTable might contain the given key using the Bloom filter.
+   *
+   * This is the first step in any key lookup. The Bloom filter provides a fast answer:
+   * - returns false, the key is definetely not in this SSTable
+   * - returns true, the key might be in this SSTable
+   *
+   * This helps reducing unnecessary disk reads when searching across multiple SSTables.
    */
   def mightContain(key: Array[Byte]): Boolean = {
     bloomFilter.mightContain(key)
   }
 
   /**
-   * Get the value for a key.
+   * Retrieves the value associated with a key from this SSTable.
    *
-   * Uses the sparse index to find the right block, then scans the block.
+   * The lookup process works in three steps:
+   *   1. Use the sparse index to find which block might contain the key. The sparse index performs
+   *      a binary search to locate the largest indexed key that is less than or equal to our
+   *      search key, giving us the block's file offset.
+   *      2. Read the block from disk (via memory mapping).
+   *      3. Search within the block for the exact key. Small blocks use linear scan (better
+   *      cache locality), while larger blocks use binary search (fewer comparisons).
+   *
+   * @param key The key to look up
+   * @return The MemTableEntry containing the value and metadata, or null if not found
    */
   def get(key: Array[Byte]): MemTableEntry = {
-    // Use sparse index to find the block that might contain the key
+    // Step 1: Use sparse index to find the block that might contain the key
     val blockOffset = sparseIndex.findBlock(key)
-    if (blockOffset < 0) {
-      return null
-    }
+    if (blockOffset < 0) return null
 
-    // Read the block
+    // Step 2: Memory-map the file and position at the block start
     val buffer = ensureMapped()
     buffer.position(blockOffset.toInt)
 
     val numBlockEntries = buffer.getInt()
 
-    // For very small blocks, linear scan is faster due to cache locality
-    if (numBlockEntries <= 8) {
-      return linearScanBlock(buffer, key, numBlockEntries)
-    }
+    // Step 3: Search within the block. For blocks with 8 or fewer entries, linear scan
+    // is faster due to sequential memory access patterns (cache-friendly). For larger
+    // blocks, binary search reduces the number of key comparisons.
+    if (numBlockEntries <= 8) return linearScanBlock(buffer, key, numBlockEntries)
 
-    // For larger blocks, use binary search approach
     binarySearchBlock(buffer, blockOffset.toInt + 4, key, numBlockEntries)
   }
 
   /**
-   * Linear scan for small blocks (better cache locality).
+   * Performs a linear scan through a block to find a key.
+   *
+   * Linear scan reads entries sequentially from the buffer. This is optimal for small
+   * blocks because: (a) fewer comparisons are needed anyway, and (b) sequential memory
+   * access has excellent cache locality, making each read faster than random access.
+   *
+   * The scan stops early if we encounter a key greater than our search key (since
+   * entries are sorted), avoiding unnecessary reads.
    */
   private def linearScanBlock(
-      buffer: MappedByteBuffer,
-      key: Array[Byte],
-      numEntries: Int): MemTableEntry = {
+                               buffer: MappedByteBuffer,
+                               key: Array[Byte],
+                               numEntries: Int
+                             ): MemTableEntry = {
     for (_ <- 0 until numEntries) {
       val keyLen = buffer.getInt()
       val entryKey = new Array[Byte](keyLen)
@@ -152,27 +193,33 @@ class SSTable private[state] (
       val seqNum = buffer.getLong()
 
       val cmp = compareByteArrays(entryKey, key)
-      if (cmp == 0) {
-        return MemTableEntry(if (isDeleted) null else entryValue, seqNum)
-      } else if (cmp > 0) {
-        return null
-      }
+      if (cmp == 0) return MemTableEntry(if (isDeleted) null else entryValue, seqNum)
+      else if (cmp > 0) return null
     }
     null
   }
 
   /**
-   * Binary search for larger blocks (O(log n) comparisons).
+   * Performs binary search within a block to find a key.
+   *
+   * For blocks with more than 8 entries, binary search reduces the number of key
+   * comparisons from O(n) to O(log n). However, binary search requires random access
+   * to entries, so we first build an offset array that maps each entry index to its
+   * byte position within the block.
+   *
+   * The trade-off: we spend O(n) time building the offset array, but then only O(log n)
+   * key comparisons. For large blocks with expensive key comparisons, this is worthwhile.
    */
   private def binarySearchBlock(
-      buffer: MappedByteBuffer,
-      blockStart: Int,
-      key: Array[Byte],
-      numEntries: Int): MemTableEntry = {
+                                 buffer: MappedByteBuffer,
+                                 blockStart: Int,
+                                 key: Array[Byte],
+                                 numEntries: Int
+                               ): MemTableEntry = {
     // First, build offset array for binary search
     val offsets = new Array[Int](numEntries)
     var pos = blockStart
-    
+
     for (i <- 0 until numEntries) {
       offsets(i) = pos
       val keyLen = buffer.getInt(pos)
@@ -218,42 +265,51 @@ class SSTable private[state] (
   }
 
   /**
-   * Iterator over all entries in this SSTable.
+   * Returns an iterator over all entries in this SSTable in sorted key order.
    */
-  def iterator: Iterator[(Array[Byte], MemTableEntry)] = {
-    new SSTableIterator(this)
-  }
+  def iterator: Iterator[(Array[Byte], MemTableEntry)] = { new SSTableIterator(this) }
 
   /**
-   * Iterator starting from a specific key.
-   * Uses sparse index to seek to the approximate position.
+   * Returns an iterator starting from a specific key (inclusive).
+   *
+   * This uses the sparse index to efficiently seek to the approximate position,
+   * avoiding a full scan
    */
   def iteratorFrom(fromKey: Array[Byte]): Iterator[(Array[Byte], MemTableEntry)] = {
     new SSTableSeekIterator(this, fromKey, null)
   }
 
   /**
-   * Iterator for keys with a specific prefix.
-   * Uses sparse index to seek to prefix start and stops when prefix no longer matches.
+   * Returns an iterator for all keys matching a given prefix.
    */
   def prefixIterator(prefix: Array[Byte]): Iterator[(Array[Byte], MemTableEntry)] = {
     new SSTableSeekIterator(this, prefix, prefix)
   }
 
   /**
-   * Get the size of this SSTable in bytes.
+   * Returns the total file size of this SSTable in bytes.
+   * Includes data blocks, Bloom filter, sparse index, and footer.
    */
-  def size: Long = file.length()
+  def size: Long = { file.length() }
 
   /**
-   * Get the estimated memory used by the Bloom filter.
+   * Returns the estimated heap memory used by the Bloom filter.
+   * The Bloom filter is kept in memory for fast negative lookups, so this
+   * contributes to the overall memory footprint of the state store.
    */
-  def bloomFilterMemory: Long = bloomFilter.estimatedMemory
+  def bloomFilterMemory: Long = { bloomFilter.estimatedMemory }
 
+  /**
+   * Releases resources associated with this SSTable.
+   *
+   * Memory-mapped files in Java require special handling because the JVM does not
+   * automatically unmap them when the MappedByteBuffer is garbage collected.
+   * On Windows, this can prevent file deletion. Using reflection to access the internal Cleaner
+   * and explicitly release the mapping.
+   */
   override def close(): Unit = {
     synchronized {
       if (mappedBuffer != null) {
-        // Force unmap (helps with file deletion on Windows)
         val cleanerMethod = mappedBuffer.getClass.getMethod("cleaner")
         cleanerMethod.setAccessible(true)
         val cleaner = cleanerMethod.invoke(mappedBuffer)
@@ -273,7 +329,8 @@ class SSTable private[state] (
   }
 
   /**
-   * Delete the SSTable file.
+   * Deletes the SSTable file from disk.
+   * Closes any open resources first to ensure the file can be deleted (especially on Windows).
    */
   def delete(): Unit = {
     close()
@@ -283,18 +340,26 @@ class SSTable private[state] (
 
 object SSTable extends Logging {
 
+  // Magic number 0x5354424C identifies valid SSTable files and guards against accidental corruption
+  // or reading wrong file types.
   private val MAGIC_NUMBER = 0x5354424C // "STBL"
+
+  // Version number for SSTable format. Increment when making incompatible changes to ensure old
+  // versions can detect and reject newer format files.
   private val VERSION = 1
 
   /**
-   * Create an SSTable from a MemTable.
+   * Creates an SSTable from a MemTable's contents.
+   * This is called during the flush operation when a MemTable reaches its size limit.
+   * All entries from the MemTable are written to a new SSTable file on disk.
    */
   def createFromMemTable(
-      memTable: MemTable,
-      directory: File,
-      blockSize: Int,
-      bloomFilterFpp: Double,
-      sparseIndexInterval: Int): SSTable = {
+                          memTable: MemTable,
+                          directory: File,
+                          blockSize: Int,
+                          bloomFilterFpp: Double,
+                          sparseIndexInterval: Int
+                        ): SSTable = {
 
     val entries = memTable.iterator.toArray
     createFromEntriesInternal(
@@ -308,14 +373,19 @@ object SSTable extends Logging {
   }
 
   /**
-   * Create an SSTable from a sequence of entries.
+   * Creates an SSTable from a sequence of sorted entries.
+   *
+   * This is called during compaction when merging multiple SSTables. The entries must already be
+   * sorted by key. Duplicate keys is being resolved before calling this method by keeping
+   * only the entry with the highest sequence number).
    */
   def createFromEntries(
-      entries: Iterable[(Array[Byte], MemTableEntry)],
-      directory: File,
-      blockSize: Int,
-      bloomFilterFpp: Double,
-      sparseIndexInterval: Int): SSTable = {
+                         entries: Iterable[(Array[Byte], MemTableEntry)],
+                         directory: File,
+                         blockSize: Int,
+                         bloomFilterFpp: Double,
+                         sparseIndexInterval: Int
+                       ): SSTable = {
 
     val entriesArray = entries.toArray
     createFromEntriesInternal(
@@ -328,21 +398,36 @@ object SSTable extends Logging {
     )
   }
 
-  // createFromEntriesInternal: Streaming SSTable creation (memory-efficient)
-  // This method streams data directly to disk instead of buffering in memory.
-  // Memory usage is O(bloom_filter + sparse_index) regardless of data size.
-  // Uses CountingOutputStream to track byte positions without buffering.
+  /**
+   * Internal method that performs the actual SSTable creation.
+   *
+   * This method is designed for memory efficiency. Instead of buffering all entries in memory
+   * before writing, it streams data directly to disk. Memory usage remains
+   * O(bloom_filter + sparse_index) regardless of how much data is being written.
+   *
+   * KEY COMPONENTS:
+   *   - Bloom Filter: Built incrementally by adding each key as we stream. Uses
+   *     approximately 1.2 bytes per key at 1% false positive probability.
+   *   - Sparse Index: Records one key-to-offset mapping per sparseIndexInterval entries.
+   *     Memory usage is about 24 bytes per entry (key clone + offset).
+   *   - Data Blocks: Written directly to disk. Block boundaries are determined by the
+   *     blockSize parameter. Each block contains multiple sorted entries.
+   *
+   * WRITE PERFORMANCE:
+   * Using a 256 KB BufferedOutputStream for optimal sequential write performance.
+   * CountingOutputStream wrapper tracks the current file position without requiring
+   * additional buffering.
+   */
   private def createFromEntriesInternal(
-      entries: Iterator[(Array[Byte], MemTableEntry)],
-      numEntries: Int,
-      directory: File,
-      blockSize: Int,
-      bloomFilterFpp: Double,
-      sparseIndexInterval: Int): SSTable = {
+                                         entries: Iterator[(Array[Byte], MemTableEntry)],
+                                         numEntries: Int,
+                                         directory: File,
+                                         blockSize: Int,
+                                         bloomFilterFpp: Double,
+                                         sparseIndexInterval: Int
+                                       ): SSTable = {
 
-    if (numEntries == 0) {
-      throw new IllegalArgumentException("Cannot create empty SSTable")
-    }
+    if (numEntries == 0) throw new IllegalArgumentException("Cannot create empty SSTable")
 
     val file = new File(directory, s"sstable_${UUID.randomUUID()}.sst")
     // Use 256KB buffer for optimal sequential write performance
@@ -353,11 +438,8 @@ object SSTable extends Logging {
     val dataOutput = new DataOutputStream(countingOutput)
 
     try {
-      // Build Bloom filter incrementally (memory: ~1.2 bytes per key at 1% FPP)
       val bloomFilter = LSMBloomFilter(numEntries, bloomFilterFpp)
-      // Sparse index entries (memory: ~24 bytes per entry, one per sparseIndexInterval keys)
       val sparseIndex = new SparseIndex()
-
       var currentBlockSize = 0
       var currentBlockEntries = 0
       var currentBlockStart = 0L
@@ -367,7 +449,6 @@ object SSTable extends Logging {
       var entryCount = 0L
       var indexCounter = 0
 
-      // Stream entries directly to disk - no buffering of data
       for ((key, entry) <- entries) {
         // Update min/max keys (only clone first and last)
         if (minKey == null) minKey = key.clone()
@@ -377,6 +458,12 @@ object SSTable extends Logging {
         bloomFilter.put(key)
 
         // Calculate entry size for block management
+        // 4: The bytes size for the key.
+        // key.length: The bytes for the actual key data itself.
+        // 4: The bytes size for the value
+        // The actual value data: Takes entry.value.length bytes if a value exists, 0 if tombstone.
+        // 1: A deleted flag. 1 means the entry is a tombstone, 0 means it's a normal entry.
+        // 8: The bytes to store the sequence number as a Long. This is a monotonically inc number
         val entrySize = 4 + key.length + 4 +
           (if (entry.value != null) entry.value.length else 0) + 1 + 8
 
@@ -391,19 +478,18 @@ object SSTable extends Logging {
         }
 
         // First entry in block - record for sparse index
-        if (firstKeyInBlock == null) {
-          firstKeyInBlock = key.clone()
-        }
+        if (firstKeyInBlock == null) firstKeyInBlock = key.clone()
 
-        // Write entry directly to disk (through buffer)
         dataOutput.writeInt(key.length)
         dataOutput.write(key)
+
         if (entry.value != null) {
           dataOutput.writeInt(entry.value.length)
           dataOutput.write(entry.value)
         } else {
           dataOutput.writeInt(-1) // Tombstone marker
         }
+
         dataOutput.writeByte(if (entry.isDeleted) 1 else 0)
         dataOutput.writeLong(entry.sequenceNumber)
 
@@ -420,112 +506,90 @@ object SSTable extends Logging {
       }
 
       // Finalize last block
-      if (firstKeyInBlock != null) {
-        sparseIndex.addEntry(firstKeyInBlock, currentBlockStart)
-      }
+      if (firstKeyInBlock != null) sparseIndex.addEntry(firstKeyInBlock, currentBlockStart)
 
       // Clone maxKey now (we only kept reference during iteration)
       maxKey = maxKey.clone()
 
       // Flush data section and record size
       dataOutput.flush()
+
       val dataSize = countingOutput.getBytesWritten
 
-      // Write Bloom filter (serialized, typically small)
+      // Write Bloom filter (serialized)
       val bloomBytes = bloomFilter.toBytes()
       bufferedOutput.write(bloomBytes)
 
-      // Write sparse index (serialized, typically small)
+      // Write sparse index (serialized)
       val indexBytes = sparseIndex.toBytes()
       bufferedOutput.write(indexBytes)
 
       // Write footer with metadata
       val footerOutput = new DataOutputStream(bufferedOutput)
+      footerOutput.writeInt(minKey.length)
+      footerOutput.write(minKey)
+      footerOutput.writeInt(maxKey.length)
+      footerOutput.write(maxKey)
       footerOutput.writeInt(MAGIC_NUMBER)
       footerOutput.writeInt(VERSION)
       footerOutput.writeLong(dataSize)
       footerOutput.writeInt(bloomBytes.length)
       footerOutput.writeInt(indexBytes.length)
       footerOutput.writeLong(entryCount)
-      footerOutput.writeInt(minKey.length)
-      footerOutput.write(minKey)
-      footerOutput.writeInt(maxKey.length)
-      footerOutput.write(maxKey)
 
       footerOutput.flush()
       bufferedOutput.flush()
 
-      new SSTable(
-        file,
-        dataSize,
-        bloomFilter,
-        sparseIndex,
-        minKey,
-        maxKey,
-        entryCount
-      )
-
+      new SSTable(file, dataSize, bloomFilter, sparseIndex, minKey, maxKey, entryCount)
     } finally {
-      // Close all streams (closing outer stream closes inner ones)
       bufferedOutput.close()
     }
   }
 
   /**
-   * Load an existing SSTable from file.
+   * Loads an existing SSTable from a file on disk.
+   *
+   * This is called during startup to restore state from previously written SSTables.
+   * The loading process is as follows:
+   * 1. Read the file footer first (which contains data size, Bloom filter size,
+   * index size, entry count, min/max keys), then loads the Bloom filter and sparse index
+   * into memory.
+   * 2. Verify the magic number and version to ensure file integrity.
+   * 3. Load the Bloom filter into memory (required for fast lookups)
+   * 4. Load the sparse index into memory (required for block-level seeks)
+   * 5. Return an SSTable object.
    */
   def load(file: File): SSTable = {
     val raf = new RandomAccessFile(file, "r")
     try {
-      // Read footer (last 48+ bytes)
-      val footerSize = 4 + 4 + 8 + 4 + 4 + 8 // Fixed part of footer
-      raf.seek(file.length() - footerSize)
+      val footerSize = 4 + 4 + 8 + 4 + 4 + 8 // 32 bytes. Last 6 pieces of footer.
+      raf.seek(file.length() - footerSize) // This will position us to Magic number.
 
       val magic = raf.readInt()
-      if (magic != MAGIC_NUMBER) {
-        throw new IOException(s"Invalid SSTable magic number: $magic")
-      }
+      if (magic != MAGIC_NUMBER) throw new IOException(s"Invalid SSTable magic number: $magic")
 
       val version = raf.readInt()
-      if (version != VERSION) {
-        throw new IOException(s"Unsupported SSTable version: $version")
-      }
+      if (version != VERSION) throw new IOException(s"Unsupported SSTable version: $version")
 
       val dataSize = raf.readLong()
       val bloomSize = raf.readInt()
       val indexSize = raf.readInt()
       val numEntries = raf.readLong()
-
-      // Read min/max keys (at end of footer)
       val minKeyLen = raf.readInt()
       val minKey = new Array[Byte](minKeyLen)
       raf.readFully(minKey)
-
       val maxKeyLen = raf.readInt()
       val maxKey = new Array[Byte](maxKeyLen)
       raf.readFully(maxKey)
-
-      // Read Bloom filter
       raf.seek(dataSize)
       val bloomBytes = new Array[Byte](bloomSize)
       raf.readFully(bloomBytes)
       val bloomFilter = LSMBloomFilter.fromBytes(bloomBytes)
-
-      // Read sparse index
       val indexBytes = new Array[Byte](indexSize)
       raf.readFully(indexBytes)
       val sparseIndex = SparseIndex.fromBytes(indexBytes)
 
-      new SSTable(
-        file,
-        dataSize,
-        bloomFilter,
-        sparseIndex,
-        minKey,
-        maxKey,
-        numEntries
-      )
-
+      new SSTable(file, dataSize, bloomFilter, sparseIndex, minKey, maxKey, numEntries)
     } finally {
       raf.close()
     }
@@ -533,10 +597,28 @@ object SSTable extends Logging {
 }
 
 /**
- * Iterator over entries in an SSTable.
+ * Sequential iterator over all entries in an SSTable.
+ *
+ * This iterator reads entries in sorted key order, starting from the beginning of the
+ * data section. It uses a memory-mapped buffer for efficient sequential reads, which
+ * allows the OS to optimize prefetching and caching.
+ *
+ * IMPLEMENTATION NOTES:
+ *
+ *   - Creates its own memory mapping independent of the SSTable's mapping. This avoids
+ *     contention and allows the iterator to maintain its own read position.
+ *
+ *   - Uses prefetching: the next entry is always read ahead so hasNext() can return
+ *     immediately without I/O.
+ *
+ *   - Gracefully handles read errors by terminating iteration rather than throwing.
+ *
+ * @param ssTable The SSTable to iterate over
  */
 private class SSTableIterator(ssTable: SSTable) extends Iterator[(Array[Byte], MemTableEntry)] {
 
+  // Create our own memory mapping for independent position tracking.
+  // The channel is closed immediately after mapping - the mapping remains valid.
   private val buffer = ssTable.synchronized {
     val channel = FileChannel.open(ssTable.file.toPath, StandardOpenOption.READ)
     try {
@@ -549,7 +631,7 @@ private class SSTableIterator(ssTable: SSTable) extends Iterator[(Array[Byte], M
   private var entriesRemaining = ssTable.numEntries
   private var nextEntry: (Array[Byte], MemTableEntry) = _
 
-  // Prefetch first entry
+  // Prefetch the first entry so hasNext() works correctly from the start
   fetchNext()
 
   private def fetchNext(): Unit = {
@@ -597,19 +679,36 @@ private class SSTableIterator(ssTable: SSTable) extends Iterator[(Array[Byte], M
 }
 
 /**
- * Iterator that seeks to a starting key and optionally stops at a prefix boundary.
+ * Seeking iterator that can start from a specific key and optionally filter by prefix.
  *
- * Uses the sparse index to efficiently seek to the approximate position,
- * then scans forward to find the exact starting point.
+ * Unlike the sequential SSTableIterator, this iterator uses the sparse index to jump
+ * directly to the approximate location of the starting key, avoiding a full scan from
+ * the beginning of the file.
  *
- * @param ssTable The SSTable to iterate
- * @param seekKey The key to seek to (inclusive)
- * @param prefixFilter If non-null, stops iteration when key no longer has this prefix
+ * HOW SEEKING WORKS:
+ *
+ *   1. Use the sparse index to find the block that might contain the seek key. The
+ *      sparse index gives us the largest indexed key <= our seek key, and its block offset.
+ *
+ * 2. Position the buffer at that block offset and begin scanning forward.
+ *
+ * 3. Skip entries until we find one with key >= seekKey. This is the starting point.
+ *
+ * PREFIX FILTERING:
+ *
+ * When a prefix filter is provided, the iterator automatically stops when it encounters
+ * a key that no longer matches the prefix. This is efficient because keys are sorted -
+ * once we pass the prefix boundary, no more matching keys can exist.
+ *
+ * @param ssTable      The SSTable to iterate over
+ * @param seekKey      The key to start iteration from (inclusive lower bound)
+ * @param prefixFilter Optional prefix filter - iteration stops when keys no longer match
  */
 private class SSTableSeekIterator(
-    ssTable: SSTable,
-    seekKey: Array[Byte],
-    prefixFilter: Array[Byte]) extends Iterator[(Array[Byte], MemTableEntry)] {
+                                   ssTable: SSTable,
+                                   seekKey: Array[Byte],
+                                   prefixFilter: Array[Byte]
+                                 ) extends Iterator[(Array[Byte], MemTableEntry)] {
 
   import LSMTree.compareByteArrays
 
@@ -746,22 +845,48 @@ private class SSTableSeekIterator(
 }
 
 /**
- * Bloom filter optimized for LSM-Tree use cases.
+ * Bloom filter for fast probabilistic key membership testing.
  *
- * Uses a simple but effective implementation based on multiple hash functions
- * derived from two base hashes (Kirsch-Mitzenmacher optimization).
+ * A Bloom filter is a space-efficient probabilistic data structure that answers the
+ * question "is this key in the set?" with either "definitely not" or "maybe yes".
+ * There are no false negatives - if the filter says "no", the key is definitely absent.
+ * False positives are possible but controlled by the false positive probability (FPP).
+ *
+ * ALGORITHM (Kirsch-Mitzenmacher Optimization):
+ *
+ * Instead of computing k independent hash functions, we use a technique from the 2006
+ * paper by Kirsch and Mitzenmacher that derives k hash values from just two base hashes.
+ * The formula is: h_i(x) = h1(x) + i * h2(x)
+ *
+ * This is mathematically proven to maintain the same false positive probability while
+ * being much faster (only 2 hash computations instead of k).
+ *
+ * WHY BLOOM FILTERS IN LSM-TREES:
+ *
+ * LSM-Trees may have many SSTables, and a key lookup might need to search all of them.
+ * Bloom filters let us skip SSTables that definitely don't contain the key. With 1% FPP,
+ * we eliminate 99% of unnecessary disk reads on average.
+ *
+ * MEMORY USAGE:
+ *
+ * At 1% FPP, a Bloom filter uses approximately 9.6 bits (1.2 bytes) per key. For example,
+ * 1 million keys requires about 1.2 MB. This is much smaller than storing actual keys.
  */
-class LSMBloomFilter private[state] (
-    private val numBits: Int,
-    private val numHashFunctions: Int,
-    private val bitArray: Array[Long]) {
+class LSMBloomFilter private[state](
+                                     private val numBits: Int,
+                                     private val numHashFunctions: Int,
+                                     private val bitArray: Array[Long]) {
 
   /**
-   * Add a key to the Bloom filter.
+   * Adds a key to the Bloom filter.
+   *
+   * Sets k bits in the bit array based on the key's hash values. Once a bit is set,
+   * it stays set (Bloom filters don't support deletion).
    */
   def put(key: Array[Byte]): Unit = {
     val (h1, h2) = hash(key)
     for (i <- 0 until numHashFunctions) {
+      // Kirsch-Mitzenmacher: h_i = h1 + i * h2
       val bit = ((h1 + i.toLong * h2) & Long.MaxValue) % numBits
       val longIndex = (bit / 64).toInt
       val bitIndex = (bit % 64).toInt
@@ -770,9 +895,13 @@ class LSMBloomFilter private[state] (
   }
 
   /**
-   * Check if a key might be in the set.
+   * Checks if a key might be in the set.
    *
-   * @return true if the key might be present, false if definitely not present
+   * Returns false if the key is DEFINITELY NOT in the set (100% accurate).
+   * Returns true if the key MIGHT be in the set (small chance of false positive).
+   *
+   * The check verifies that all k bits for this key are set. If any bit is 0,
+   * the key was never added.
    */
   def mightContain(key: Array[Byte]): Boolean = {
     val (h1, h2) = hash(key)
@@ -781,14 +910,15 @@ class LSMBloomFilter private[state] (
       val longIndex = (bit / 64).toInt
       val bitIndex = (bit % 64).toInt
       if ((bitArray(longIndex) & (1L << bitIndex)) == 0) {
-        return false
+        return false // Definitely not in the set
       }
     }
-    true
+    true // Might be in the set
   }
 
   /**
-   * Serialize to bytes.
+   * Serializes the Bloom filter to a byte array for storage.
+   * Format: numBits (4 bytes) + numHashFunctions (4 bytes) + bit array (variable)
    */
   def toBytes(): Array[Byte] = {
     val buffer = ByteBuffer.allocate(4 + 4 + bitArray.length * 8)
@@ -801,12 +931,15 @@ class LSMBloomFilter private[state] (
   }
 
   /**
-   * Estimated memory usage.
+   * Returns the estimated heap memory usage of this Bloom filter in bytes.
+   * Includes the bit array plus object overhead.
    */
   def estimatedMemory: Long = bitArray.length * 8L + 16
 
   /**
-   * Hash function using MurmurHash3.
+   * Computes two independent 64-bit MurmurHash3 values for a key.
+   * These serve as the base hashes h1 and h2 for the Kirsch-Mitzenmacher optimization.
+   * Different seed values ensure the hashes are independent.
    */
   private def hash(key: Array[Byte]): (Long, Long) = {
     val h1 = MurmurHash3.hash64(key, 0, key.length, 0x9747b28c)
@@ -815,23 +948,49 @@ class LSMBloomFilter private[state] (
   }
 }
 
+/**
+ * Factory object for creating and deserializing Bloom filters.
+ */
 object LSMBloomFilter {
 
   /**
-   * Create a new Bloom filter.
+   * Creates a new Bloom filter optimized for the expected number of keys.
    *
-   * @param expectedInsertions Expected number of insertions
-   * @param fpp False positive probability (e.g., 0.01 for 1%)
+   * The size of the bit array and number of hash functions are calculated using
+   * well-known optimal formulas that minimize the false positive probability for
+   * a given memory budget.
+   *
+   * OPTIMAL SIZE FORMULA:
+   *
+   * The optimal number of bits is: m = -n * ln(p) / (ln(2))^2
+   *
+   * Where:
+   *   - n = expected number of insertions
+   *   - p = desired false positive probability (e.g., 0.01 for 1%)
+   *
+   * For p = 0.01 (1% FPP), this works out to about 9.6 bits per key.
+   *
+   * OPTIMAL HASH FUNCTION COUNT:
+   *
+   * The optimal number of hash functions is: k = (m/n) * ln(2)
+   *
+   * For p = 0.01, this is approximately 7 hash functions.
+   *
+   * @param expectedInsertions The number of keys expected to be inserted
+   * @param fpp                The desired false positive probability (0.01 = 1%)
    */
   def apply(expectedInsertions: Int, fpp: Double): LSMBloomFilter = {
-    // Optimal number of bits: -n * ln(p) / (ln(2)^2)
+    // Calculate optimal number of bits using the formula: m = -n * ln(p) / (ln(2))^2
+    // Ensure at least 64 bits (one Long) to avoid edge cases
     val numBits = math.ceil(-expectedInsertions * math.log(fpp) /
       (math.log(2) * math.log(2))).toInt.max(64)
 
-    // Optimal number of hash functions: (m/n) * ln(2)
+    // Calculate optimal number of hash functions: k = (m/n) * ln(2)
+    // Ensure at least 1 hash function
     val numHashFunctions = math.ceil(numBits.toDouble /
       expectedInsertions * math.log(2)).toInt.max(1)
 
+    // Allocate bit array as Array[Long] for efficient 64-bit operations
     val numLongs = (numBits + 63) / 64
     val bitArray = new Array[Long](numLongs)
 
@@ -839,7 +998,8 @@ object LSMBloomFilter {
   }
 
   /**
-   * Deserialize from bytes.
+   * Reconstructs a Bloom filter from its serialized byte representation.
+   * Used when loading SSTables from disk.
    */
   def fromBytes(bytes: Array[Byte]): LSMBloomFilter = {
     val buffer = ByteBuffer.wrap(bytes)
@@ -855,24 +1015,46 @@ object LSMBloomFilter {
 }
 
 /**
- * MurmurHash3 implementation for Bloom filter hashing.
+ * MurmurHash3 128-bit hash function (64-bit output variant).
+ *
+ * MurmurHash3 is a non-cryptographic hash function known for:
+ *   - Excellent distribution: produces uniformly distributed hash values
+ *   - High performance: optimized for speed with minimal collisions
+ *   - Avalanche effect: small input changes cause large output changes
+ *
+ * This implementation is based on the x64 128-bit variant from the original
+ * MurmurHash3 by Austin Appleby. We use different seeds to generate two
+ * independent 64-bit hash values for the Bloom filter.
+ *
+ * Reference: https://github.com/aappleby/smhasher/wiki/MurmurHash3
  */
 object MurmurHash3 {
 
+  // Magic constants from the MurmurHash3 specification.
+  // These specific values are chosen to provide good mixing properties.
   private val C1: Long = 0x87c37b91114253d5L
   private val C2: Long = 0x4cf5ad432745937fL
 
+  /**
+   * Computes a 64-bit MurmurHash3 hash of the input data.
+   *
+   * @param data   The byte array to hash
+   * @param offset Starting offset in the array
+   * @param length Number of bytes to hash
+   * @param seed   Initial seed value (different seeds produce different hashes)
+   * @return A 64-bit hash value
+   */
   def hash64(data: Array[Byte], offset: Int, length: Int, seed: Int): Long = {
     var h = seed.toLong
     val nblocks = length / 8
 
-    // Body
+    // Process the input in 8-byte blocks for efficiency
     for (i <- 0 until nblocks) {
       val k = getLongLittleEndian(data, offset + i * 8)
       h = mix64(h, k)
     }
 
-    // Tail
+    // Handle remaining bytes (0-7) that don't fill a complete block
     val tailOffset = offset + nblocks * 8
     var k: Long = 0
     length & 7 match {
@@ -961,32 +1143,58 @@ object MurmurHash3 {
 }
 
 /**
- * Sparse index for efficient block lookup in SSTables.
+ * Sparse index for fast block-level lookups in SSTables.
  *
- * Maps keys to block offsets at regular intervals.
+ * WHY SPARSE INDEXING:
+ *
+ * A "dense" index would map every key to its file offset, but this requires too much
+ * memory for large SSTables. Instead, we use a "sparse" index that only records one
+ * key per N entries (controlled by sparseIndexInterval).
+ *
+ * During lookup, we binary search the sparse index to find the block containing our
+ * key, then scan within that block. This trades a small amount of extra scanning for
+ * significant memory savings.
+ *
+ * EXAMPLE:
+ *
+ * If sparseIndexInterval = 64 and we have 1000 keys, the sparse index has about 16
+ * entries. Binary search finds the right block in O(log 16) = 4 comparisons, then
+ * we scan up to 64 entries within the block.
+ *
+ * DATA STRUCTURE:
+ *
+ * Internally stores an array of (key, offset) pairs sorted by key. Each key is the
+ * first key of a block, and the offset is the byte position of that block in the file.
  */
 class SparseIndex {
 
   import LSMTree.compareByteArrays
 
+  // Array of (key, offset) pairs. Keys are cloned to avoid mutation issues.
   private val entries = new ArrayBuffer[(Array[Byte], Long)]()
 
   /**
-   * Add an index entry.
+   * Adds a new entry to the sparse index.
+   * The key is cloned to ensure immutability.
    */
   def addEntry(key: Array[Byte], offset: Long): Unit = {
     entries += ((key.clone(), offset))
   }
 
   /**
-   * Find the block that might contain the given key.
+   * Finds the block that might contain the given key using binary search.
    *
-   * @return Block offset, or -1 if key is smaller than all indexed keys
+   * The algorithm finds the largest indexed key that is less than or equal to the
+   * search key. This gives us the block where the key would exist if it's in the
+   * SSTable at all.
+   *
+   * @param key The key to search for
+   * @return The byte offset of the block, or -1 if the key is smaller than all indexed keys
    */
   def findBlock(key: Array[Byte]): Long = {
     if (entries.isEmpty) return -1
 
-    // Binary search for the largest entry <= key
+    // Binary search for the largest entry with key <= search key
     var low = 0
     var high = entries.length - 1
     var result = -1L
@@ -996,8 +1204,9 @@ class SparseIndex {
       val cmp = compareByteArrays(entries(mid)._1, key)
 
       if (cmp <= 0) {
+        // This entry's key <= search key, so this block might contain our key
         result = entries(mid)._2
-        low = mid + 1
+        low = mid + 1 // Look for a larger matching entry
       } else {
         high = mid - 1
       }
@@ -1007,12 +1216,14 @@ class SparseIndex {
   }
 
   /**
-   * Get the number of index entries.
+   * Returns the number of entries in the sparse index.
+   * This indicates roughly how many blocks the SSTable has.
    */
   def size: Int = entries.length
 
   /**
-   * Serialize to bytes.
+   * Serializes the sparse index to a byte array for storage in the SSTable file.
+   * Format: count (4 bytes) + [key_length (4 bytes) + key + offset (8 bytes)] for each entry
    */
   def toBytes(): Array[Byte] = {
     val baos = new ByteArrayOutputStream()
@@ -1030,10 +1241,14 @@ class SparseIndex {
   }
 }
 
+/**
+ * Factory for deserializing sparse indexes from byte arrays.
+ */
 object SparseIndex {
 
   /**
-   * Deserialize from bytes.
+   * Reconstructs a sparse index from its serialized byte representation.
+   * Used when loading SSTables from disk.
    */
   def fromBytes(bytes: Array[Byte]): SparseIndex = {
     val input = new DataInputStream(new ByteArrayInputStream(bytes))
@@ -1052,17 +1267,24 @@ object SparseIndex {
   }
 }
 
-// =============================================================================
-// CountingOutputStream - Tracks bytes written without buffering
-// =============================================================================
-// A lightweight wrapper that counts bytes written to the underlying stream.
-// Used during SSTable creation to track file positions without buffering
-// all data in memory. Zero overhead - just increments a counter.
-// =============================================================================
-
 /**
- * An OutputStream wrapper that counts bytes written.
- * This allows tracking file position without buffering data in memory.
+ * A lightweight OutputStream wrapper that counts bytes written without buffering.
+ *
+ * PURPOSE:
+ *
+ * During SSTable creation, we need to know the current file position to record
+ * block offsets in the sparse index. Without this wrapper, we would need to either:
+ *   - Buffer everything in memory (defeats streaming write benefit)
+ *   - Flush after each write and query file position (slow)
+ *
+ * CountingOutputStream solves this by simply incrementing a counter on each write.
+ * The overhead is negligible (just an addition per write call).
+ *
+ * USAGE:
+ *
+ * Wrap the BufferedOutputStream with CountingOutputStream before wrapping with
+ * DataOutputStream. This ensures all bytes are counted regardless of which write
+ * method is used.
  *
  * @param out The underlying output stream to write to
  */
@@ -1070,7 +1292,10 @@ private[state] class CountingOutputStream(out: OutputStream) extends OutputStrea
 
   private var bytesWritten: Long = 0L
 
-  /** Get the total number of bytes written so far */
+  /**
+   * Returns the total number of bytes written through this stream.
+   * This value represents the current position in the output file.
+   */
   def getBytesWritten: Long = bytesWritten
 
   override def write(b: Int): Unit = {

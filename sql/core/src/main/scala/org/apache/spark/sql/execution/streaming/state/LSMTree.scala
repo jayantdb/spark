@@ -161,7 +161,7 @@ class LSMTree(
   // BACKGROUND COMPACTION: Thread pool for merging SSTables
   // Compaction runs async to avoid blocking writes
   private val compactionExecutor: ScheduledExecutorService =
-    Executors.newScheduledThreadPool(conf.compactionThreads)
+    Executors.newScheduledThreadPool(Math.min(conf.compactionThreads, 2))
 
   // STATISTICS: Tracks hits, misses, read/write counts for monitoring
   private val stats = new LSMTreeStatsCollector()
@@ -619,7 +619,7 @@ class LSMTree(
         compactLevel0()
       }
 
-      // Higher level compaction: size-tiered strategy
+      // We determines how much larger each level is compared to the previous level.
       // Each level has a max size = memTableSize * (multiplier ^ level)
       for (level <- 1 until conf.maxLevels - 1) {
         val maxSizeAtLevel =
